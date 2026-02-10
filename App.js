@@ -4,6 +4,7 @@ import { FontAwesome5 } from "@expo/vector-icons";
 import { useKeepAwake } from "expo-keep-awake";
 import { Audio } from "expo-av";
 import styled from "styled-components/native";
+import { useRouter } from "expo-router";
 import PlayerCard from "./components/PlayerCard";
 import SetupScreen from "./components/SetupScreen";
 import MenuModal from "./components/MenuModal";
@@ -216,6 +217,7 @@ function buildRows(count) {
 
 export default function App() {
   useKeepAwake();
+  const router = useRouter();
   const [state, dispatch] = useReducer(reducer, initialState);
   const rows = useMemo(() => buildRows(state.playerCount), [state.playerCount]);
   const prevPlayersRef = useRef(state.players);
@@ -392,6 +394,10 @@ export default function App() {
         onHighroll={() => {
           dispatch({ type: "TOGGLE_MENU" });
           runHighroll();
+        }}
+        onDecks={() => {
+          dispatch({ type: "TOGGLE_MENU" });
+          router.push("/(tabs)/decks");
         }}
       />
 
