@@ -126,9 +126,11 @@ export default function CardSearchScreen() {
           paddingHorizontal: 12,
           borderRadius: 10,
           borderWidth: 1,
-          borderColor: 'rgba(255,255,255,0.4)',
+          borderColor: query.trim() ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)',
           alignSelf: 'flex-start',
+          opacity: query.trim() ? 1 : 0.6,
         }}
+        disabled={!query.trim()}
       >
         <Text style={{ color: '#ffffff' }}>Search</Text>
       </Pressable>
@@ -151,9 +153,12 @@ export default function CardSearchScreen() {
             >
               <Text style={{ color: '#ffffff', fontSize: 14 }}>{item.name}</Text>
               <Text style={{ color: '#9aa4b2', fontSize: 12 }}>{item.type_line}</Text>
-            </Pressable>
-          )}
-        />
+              </Pressable>
+            )}
+            ListEmptyComponent={
+              <Text style={{ color: '#9aa4b2' }}>Nessun risultato.</Text>
+            }
+          />
       )}
     </View>
   );

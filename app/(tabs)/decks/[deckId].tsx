@@ -48,6 +48,11 @@ export default function DeckDetailScreen() {
           <Text style={{ color: '#9aa4b2', marginTop: 6 }}>
             Commander: {commander?.name ?? 'None'}
           </Text>
+          {!commander ? (
+            <Text style={{ color: '#ffb347', marginTop: 6 }}>
+              Set a Commander to unlock card validation.
+            </Text>
+          ) : null}
           <Pressable
             onPress={() => router.push(`/(tabs)/decks/search?deckId=${deck.id}&mode=commander`)}
             style={{
@@ -96,6 +101,11 @@ export default function DeckDetailScreen() {
                 <Text style={{ color: '#9aa4b2', fontSize: 12 }}>{item.type_line}</Text>
               </View>
             )}
+            ListEmptyComponent={
+              <Text style={{ color: '#9aa4b2' }}>
+                Nessuna carta ancora. Usa “Search & Add Cards”.
+              </Text>
+            }
           />
         </>
       )}

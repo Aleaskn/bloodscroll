@@ -44,30 +44,37 @@ export default function DecksScreen() {
       {loading ? (
         <Text style={{ color: '#b6c0cf', marginTop: 16 }}>Loading…</Text>
       ) : (
-        <FlatList
-          data={decks}
-          keyExtractor={(item) => item.id}
-          contentContainerStyle={{ paddingVertical: 16, gap: 8 }}
-          renderItem={({ item }) => (
-            <View
-              style={{
-                padding: 12,
-                borderRadius: 12,
-                borderWidth: 1,
-                borderColor: 'rgba(255,255,255,0.1)',
-                backgroundColor: 'rgba(255,255,255,0.03)',
-                gap: 8,
-              }}
-            >
-              <Pressable onPress={() => router.push(`/(tabs)/decks/${item.id}`)}>
-                <Text style={{ color: '#ffffff', fontSize: 16 }}>{item.name}</Text>
-              </Pressable>
-              <Text style={{ color: '#9aa4b2', fontSize: 12, marginTop: 4 }}>
-                Updated {new Date(item.updated_at).toLocaleString()}
-              </Text>
-            </View>
-          )}
-        />
+        <>
+          {decks.length === 0 ? (
+            <Text style={{ color: '#9aa4b2', marginTop: 16 }}>
+              Nessun deck ancora. Crea il tuo primo deck.
+            </Text>
+          ) : null}
+          <FlatList
+            data={decks}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={{ paddingVertical: 16, gap: 8 }}
+            renderItem={({ item }) => (
+              <View
+                style={{
+                  padding: 12,
+                  borderRadius: 12,
+                  borderWidth: 1,
+                  borderColor: 'rgba(255,255,255,0.1)',
+                  backgroundColor: 'rgba(255,255,255,0.03)',
+                  gap: 8,
+                }}
+              >
+                <Pressable onPress={() => router.push(`/(tabs)/decks/${item.id}`)}>
+                  <Text style={{ color: '#ffffff', fontSize: 16 }}>{item.name}</Text>
+                </Pressable>
+                <Text style={{ color: '#9aa4b2', fontSize: 12, marginTop: 4 }}>
+                  Updated {new Date(item.updated_at).toLocaleString()}
+                </Text>
+              </View>
+            )}
+          />
+        </>
       )}
     </View>
   );
