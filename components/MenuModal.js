@@ -10,6 +10,7 @@ export default function MenuModal({
   soundEnabled,
   onToggleSound,
   onHighroll,
+  onDecks,
 }) {
   return (
     <Modal visible={visible} transparent animationType="fade">
@@ -17,6 +18,9 @@ export default function MenuModal({
         <Pressable style={{ flex: 1 }} onPress={onClose} />
         <Sheet>
           <SheetTitle>Game Menu</SheetTitle>
+          <ActionButton onPress={onDecks}>
+            <ActionText>Decks</ActionText>
+          </ActionButton>
           <ActionButton onPress={onHighroll}>
             <ActionText>Highroll</ActionText>
           </ActionButton>
