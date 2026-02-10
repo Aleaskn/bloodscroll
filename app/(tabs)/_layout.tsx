@@ -33,6 +33,15 @@ export default function TabLayout() {
           ),
         }}
       />
+      <Tabs.Screen
+        name="decks"
+        options={{
+          title: 'Decks',
+          tabBarIcon: ({ color }) => (
+            <IconSymbol size={28} name="rectangle.stack.fill" color={color} />
+          ),
+        }}
+      />
     </Tabs>
   );
 }
