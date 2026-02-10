@@ -1,29 +1,25 @@
-import * as SQLite from 'expo-sqlite';
+import { openDatabaseSync } from 'expo-sqlite';
 
 const DB_NAME = 'bloodscroll.db';
 const SCHEMA_VERSION = 1;
 
-const db = SQLite.openDatabase(DB_NAME);
+const db = openDatabaseSync(DB_NAME);
 
-function exec(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.transaction((tx) => {
-      tx.executeSql(
-        sql,
-        params,
-        (_, result) => resolve(result),
-        (_, error) => {
-          reject(error);
-          return false;
-        }
-      );
-    });
-  });
+async function exec(sql, params = []) {
+  return db.runAsync(sql, params);
+}
+
+async function queryAll(sql, params = []) {
+  return db.getAllAsync(sql, params);
+}
+
+async function queryFirst(sql, params = []) {
+  return db.getFirstAsync(sql, params);
 }
 
 export async function initDb() {
-  const versionResult = await exec('PRAGMA user_version;');
-  const currentVersion = versionResult.rows.item(0)?.user_version ?? 0;
+  const versionRow = await queryFirst('PRAGMA user_version;');
+  const currentVersion = versionRow?.user_version ?? 0;
 
   if (currentVersion < 1) {
     await exec(
@@ -66,8 +62,7 @@ export async function initDb() {
 }
 
 export async function listDecks() {
-  const result = await exec('SELECT * FROM decks ORDER BY updated_at DESC;');
-  return result.rows._array ?? [];
+  return queryAll('SELECT * FROM decks ORDER BY updated_at DESC;');
 }
 
 export async function createDeck(name) {
@@ -81,22 +76,21 @@ export async function createDeck(name) {
 }
 
 export async function getDeck(deckId) {
-  const deckResult = await exec('SELECT * FROM decks WHERE id = ?;', [deckId]);
-  const deck = deckResult.rows.item(0);
+  const deck = await queryFirst('SELECT * FROM decks WHERE id = ?;', [deckId]);
   if (!deck) return null;
-  const cardsResult = await exec(
+  const cards = await queryAll(
     `SELECT dc.deck_id, dc.card_id, dc.quantity, dc.is_commander, c.*
      FROM deck_cards dc
      JOIN cards c ON c.id = dc.card_id
      WHERE dc.deck_id = ?;`,
     [deckId]
   );
-  return { ...deck, cards: cardsResult.rows._array ?? [] };
+  return { ...deck, cards: cards ?? [] };
 }
 
 export async function getCard(cardId) {
-  const result = await exec('SELECT * FROM cards WHERE id = ?;', [cardId]);
-  return result.rows.item(0) || null;
+  const row = await queryFirst('SELECT * FROM cards WHERE id = ?;', [cardId]);
+  return row || null;
 }
 
 export async function upsertCard(card) {
@@ -135,12 +129,12 @@ export async function setCommander(deckId, card) {
 }
 
 export async function addCardToDeck(deckId, cardId, qty = 1) {
-  const existing = await exec(
+  const existing = await queryFirst(
     'SELECT quantity FROM deck_cards WHERE deck_id = ? AND card_id = ?;',
     [deckId, cardId]
   );
-  if (existing.rows.length) {
-    const current = existing.rows.item(0).quantity;
+  if (existing) {
+    const current = existing.quantity;
     await exec(
       'UPDATE deck_cards SET quantity = ? WHERE deck_id = ? AND card_id = ?;',
       [current + qty, deckId, cardId]
