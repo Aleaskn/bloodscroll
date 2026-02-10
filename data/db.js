@@ -94,6 +94,11 @@ export async function getDeck(deckId) {
   return { ...deck, cards: cardsResult.rows._array ?? [] };
 }
 
+export async function getCard(cardId) {
+  const result = await exec('SELECT * FROM cards WHERE id = ?;', [cardId]);
+  return result.rows.item(0) || null;
+}
+
 export async function upsertCard(card) {
   await exec(
     `INSERT OR REPLACE INTO cards
