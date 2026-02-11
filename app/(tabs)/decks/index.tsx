@@ -1,15 +1,18 @@
 import { useFocusEffect, useRouter } from 'expo-router';
 import React, { useCallback, useState } from 'react';
-import { FlatList, Pressable, Text, View } from 'react-native';
+import { FlatList, Modal, Pressable, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Image } from 'expo-image';
+import { Feather } from '@expo/vector-icons';
 import DeckBottomBar from '../../../components/decks/DeckBottomBar';
 import { DeckIdentityDots } from '../../../components/decks/DeckCardRow';
-import { createDeck, initDb, listDecksWithCommanderMeta } from '../../../data/db';
+import { createDeck, initDb, listDecksWithCommanderMeta, renameDeck } from '../../../data/db';
 
 export default function DecksScreen() {
   const [decks, setDecks] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [renameTarget, setRenameTarget] = useState(null);
+  const [renameValue, setRenameValue] = useState('');
   const router = useRouter();
 
   const load = async () => {
@@ -29,14 +32,15 @@ export default function DecksScreen() {
   const createDeckOptimistic = async () => {
     const optimistic = {
       id: `tmp_${Date.now()}`,
-      name: `New Deck ${decks.length + 1}`,
+      name: '',
       updated_at: new Date().toISOString(),
       commander_name: null,
       commander_image_uri: null,
+      commander_art_image_uri: null,
       commander_color_identity: null,
     };
     setDecks((prev) => [optimistic, ...prev]);
-    await createDeck(`New Deck ${decks.length + 1}`);
+    await createDeck('');
     await load();
   };
 
@@ -48,6 +52,32 @@ export default function DecksScreen() {
     } catch {
       return [];
     }
+  };
+
+  const getDeckAutoName = (deck, index) => {
+    const current = (deck?.name ?? '').trim();
+    if (current) return current;
+    const commanderName = (deck?.commander_name ?? '').trim();
+    if (commanderName) return commanderName;
+    return `New Deck ${index + 1}`;
+  };
+
+  const startRename = (deck, index) => {
+    setRenameTarget({ ...deck, fallbackName: getDeckAutoName(deck, index) });
+    setRenameValue(deck?.name ?? '');
+  };
+
+  const saveRename = async () => {
+    if (!renameTarget) return;
+    const trimmed = renameValue.trim();
+    const computedName = trimmed || renameTarget.commander_name?.trim() || renameTarget.fallbackName;
+    setDecks((prev) =>
+      prev.map((deck) => (deck.id === renameTarget.id ? { ...deck, name: computedName } : deck))
+    );
+    await renameDeck(renameTarget.id, computedName);
+    setRenameTarget(null);
+    setRenameValue('');
+    await load();
   };
 
   return (
@@ -83,7 +113,7 @@ export default function DecksScreen() {
               data={decks}
               keyExtractor={(item) => item.id}
               contentContainerStyle={{ paddingVertical: 16, gap: 10, paddingBottom: 100 }}
-              renderItem={({ item }) => (
+              renderItem={({ item, index }) => (
                 <Pressable
                   onPress={() => router.push(`/(tabs)/decks/${item.id}`)}
                   style={{
@@ -99,13 +129,36 @@ export default function DecksScreen() {
                   }}
                 >
                   <View style={{ flex: 1 }}>
-                    <Text style={{ color: '#ffffff', fontSize: 16 }} numberOfLines={1}>
-                      {item.name}
-                    </Text>
+                    <Pressable
+                      onPress={(event) => {
+                        event.stopPropagation();
+                        startRename(item, index);
+                      }}
+                      style={{ alignSelf: 'flex-start' }}
+                    >
+                      <Text style={{ color: '#ffffff', fontSize: 16 }} numberOfLines={1}>
+                        {getDeckAutoName(item, index)}
+                      </Text>
+                    </Pressable>
                     <Text style={{ color: '#9aa4b2', fontSize: 12, marginTop: 4 }}>
                       Updated {new Date(item.updated_at).toLocaleString()}
                     </Text>
                   </View>
+                  <Pressable
+                    onPress={(event) => {
+                      event.stopPropagation();
+                      startRename(item, index);
+                    }}
+                    style={{
+                      minWidth: 36,
+                      minHeight: 36,
+                      borderRadius: 10,
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    <Feather name="edit-2" size={16} color="#ffffff" />
+                  </Pressable>
                   <View
                     style={{
                       width: 92,
@@ -114,11 +167,12 @@ export default function DecksScreen() {
                       gap: 6,
                     }}
                   >
-                    {item.commander_image_uri ? (
+                    {item.commander_art_image_uri || item.commander_image_uri ? (
                       <Image
-                        source={{ uri: item.commander_image_uri }}
+                        source={{ uri: item.commander_art_image_uri || item.commander_image_uri }}
                         style={{ width: 74, height: 54, borderRadius: 8 }}
                         contentFit="cover"
+                        contentPosition="top"
                       />
                     ) : (
                       <View
@@ -143,6 +197,88 @@ export default function DecksScreen() {
           </>
         )}
       </View>
+      <Modal
+        visible={!!renameTarget}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setRenameTarget(null)}
+      >
+        <View
+          style={{
+            flex: 1,
+            backgroundColor: 'rgba(0,0,0,0.65)',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 20,
+          }}
+        >
+          <View
+            style={{
+              width: '100%',
+              borderRadius: 14,
+              borderWidth: 1,
+              borderColor: 'rgba(255,255,255,0.2)',
+              backgroundColor: '#131822',
+              padding: 14,
+              gap: 12,
+            }}
+          >
+            <Text style={{ color: '#ffffff', fontSize: 18, fontWeight: '600' }}>Rinomina Deck</Text>
+            <TextInput
+              value={renameValue}
+              onChangeText={setRenameValue}
+              placeholder="Nome deck"
+              placeholderTextColor="#8a93a0"
+              autoFocus
+              style={{
+                minHeight: 44,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor: 'rgba(255,255,255,0.2)',
+                color: '#ffffff',
+                paddingHorizontal: 12,
+                backgroundColor: 'rgba(255,255,255,0.03)',
+              }}
+            />
+            <View style={{ flexDirection: 'row', justifyContent: 'flex-end', gap: 10 }}>
+              <Pressable
+                onPress={() => {
+                  setRenameTarget(null);
+                  setRenameValue('');
+                }}
+                style={{
+                  minHeight: 40,
+                  minWidth: 90,
+                  borderRadius: 10,
+                  borderWidth: 1,
+                  borderColor: 'rgba(255,255,255,0.25)',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  paddingHorizontal: 10,
+                }}
+              >
+                <Text style={{ color: '#ffffff' }}>Annulla</Text>
+              </Pressable>
+              <Pressable
+                onPress={saveRename}
+                style={{
+                  minHeight: 40,
+                  minWidth: 90,
+                  borderRadius: 10,
+                  borderWidth: 1,
+                  borderColor: 'rgba(255,255,255,0.4)',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  paddingHorizontal: 10,
+                  backgroundColor: 'rgba(255,255,255,0.08)',
+                }}
+              >
+                <Text style={{ color: '#ffffff', fontWeight: '600' }}>Salva</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       <DeckBottomBar />
     </SafeAreaView>
   );
