@@ -294,6 +294,14 @@ export default function App() {
   const maxRoll = Math.max(0, ...highrollResults.map((r) => r.roll || 0));
   const winners = highrollResults.filter((r) => r.roll === maxRoll);
   const isTie = winners.length > 1;
+  const menuTopMap = {
+    2: "51.2%",
+    4: "51.6%",
+    6: "50.8%",
+  };
+  const menuButtonStyle = menuTopMap[state.playerCount]
+    ? { top: menuTopMap[state.playerCount] }
+    : undefined;
 
   const rerollHighroll = () => {
     if (!highrollResults.length) return;
@@ -379,7 +387,10 @@ export default function App() {
         </Board>
       </SafeAreaView>
 
-      <MenuButton onPress={() => dispatch({ type: "TOGGLE_MENU" })}>
+      <MenuButton
+        onPress={() => dispatch({ type: "TOGGLE_MENU" })}
+        style={menuButtonStyle}
+      >
         <MenuCore>
           <FontAwesome5 name="dice-d20" size={32} color="#eef2f6" />
         </MenuCore>
