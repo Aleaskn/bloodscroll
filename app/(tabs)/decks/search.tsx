@@ -1,8 +1,11 @@
 import React, { useState } from 'react';
 import { View, Text, Pressable, FlatList, TextInput } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { addCardToDeck, getCard, getDeck, setCommander, upsertCard } from '../../../data/db';
 import { getCachedImageUri, normalizeCard, searchCards } from '../../../data/scryfall';
+import DeckHeader from '../../../components/decks/DeckHeader';
+import DeckBottomBar from '../../../components/decks/DeckBottomBar';
 
 export default function CardSearchScreen() {
   const { deckId } = useLocalSearchParams();
@@ -12,6 +15,7 @@ export default function CardSearchScreen() {
   const [results, setResults] = useState([]);
   const [searching, setSearching] = useState(false);
   const [error, setError] = useState('');
+  const [feedback, setFeedback] = useState('');
   const [deck, setDeck] = useState(null);
   const [commander, setCommanderCard] = useState(null);
 
@@ -36,7 +40,7 @@ export default function CardSearchScreen() {
     try {
       const data = await searchCards(query.trim());
       setResults(data);
-    } catch (e) {
+    } catch {
       setResults([]);
     } finally {
       setSearching(false);
@@ -46,6 +50,7 @@ export default function CardSearchScreen() {
   const addCard = async (card) => {
     if (!deckId) return;
     setError('');
+    setFeedback('');
     const isCommanderMode = mode === 'commander';
     const commanderLegal = card.legalities?.commander === 'legal';
     const totalCards = deck?.cards?.reduce((sum, c) => sum + (c.quantity || 0), 0) ?? 0;
@@ -65,7 +70,7 @@ export default function CardSearchScreen() {
       const normalized = normalizeCard(card, imageUri);
       await upsertCard(normalized);
       await setCommander(String(deckId), normalized);
-      router.back();
+      router.replace(`/(tabs)/decks/${String(deckId)}`);
       return;
     }
 
@@ -95,71 +100,97 @@ export default function CardSearchScreen() {
     const normalized = normalizeCard(card, imageUri);
     await upsertCard(normalized);
     await addCardToDeck(String(deckId), normalized.id, 1);
-    router.back();
+    setDeck((prev) => {
+      if (!prev) return prev;
+      const existing = prev.cards?.find((c) => c.card_id === normalized.id);
+      let nextCards = prev.cards ?? [];
+      if (existing) {
+        nextCards = nextCards.map((c) =>
+          c.card_id === normalized.id ? { ...c, quantity: c.quantity + 1 } : c
+        );
+      } else {
+        nextCards = [
+          ...nextCards,
+          {
+            ...normalized,
+            card_id: normalized.id,
+            quantity: 1,
+            is_commander: 0,
+          },
+        ];
+      }
+      return { ...prev, cards: nextCards };
+    });
+    setFeedback(`Added: ${card.name}`);
   };
 
   return (
-    <View style={{ flex: 1, backgroundColor: '#0b0d10', padding: 20, gap: 12 }}>
-      <Pressable onPress={() => router.back()}>
-        <Text style={{ color: '#9aa4b2' }}>Back</Text>
-      </Pressable>
-      <Text style={{ color: '#ffffff', fontSize: 18, fontWeight: '600' }}>Search Cards</Text>
-      {error ? <Text style={{ color: '#ff8a8a' }}>{error}</Text> : null}
-      <TextInput
-        placeholder="Search Scryfall"
-        placeholderTextColor="#8a93a0"
-        value={query}
-        onChangeText={setQuery}
-        onSubmitEditing={runSearch}
-        style={{
-          backgroundColor: '#111722',
-          color: '#ffffff',
-          borderRadius: 10,
-          paddingHorizontal: 12,
-          paddingVertical: 10,
-        }}
-      />
-      <Pressable
-        onPress={runSearch}
-        style={{
-          paddingVertical: 8,
-          paddingHorizontal: 12,
-          borderRadius: 10,
-          borderWidth: 1,
-          borderColor: query.trim() ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)',
-          alignSelf: 'flex-start',
-          opacity: query.trim() ? 1 : 0.6,
-        }}
-        disabled={!query.trim()}
-      >
-        <Text style={{ color: '#ffffff' }}>Search</Text>
-      </Pressable>
-      {searching ? (
-        <Text style={{ color: '#b6c0cf' }}>Searching…</Text>
-      ) : (
-        <FlatList
-          data={results}
-          keyExtractor={(item) => item.id}
-          contentContainerStyle={{ gap: 8, paddingBottom: 16 }}
-          renderItem={({ item }) => (
-            <Pressable
-              onPress={() => addCard(item)}
-              style={{
-                padding: 10,
-                borderRadius: 10,
-                borderWidth: 1,
-                borderColor: 'rgba(255,255,255,0.15)',
-              }}
-            >
-              <Text style={{ color: '#ffffff', fontSize: 14 }}>{item.name}</Text>
-              <Text style={{ color: '#9aa4b2', fontSize: 12 }}>{item.type_line}</Text>
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0d10' }} edges={['top', 'left', 'right']}>
+      <View style={{ flex: 1, paddingHorizontal: 20, gap: 12 }}>
+        <DeckHeader
+          title={mode === 'commander' ? 'Set Commander' : 'Search Cards'}
+          subtitle="Ricerca da Scryfall"
+        />
+        {error ? <Text style={{ color: '#ff8a8a' }}>{error}</Text> : null}
+        {feedback ? <Text style={{ color: '#82d68b' }}>{feedback}</Text> : null}
+        <TextInput
+          placeholder="Search Scryfall"
+          placeholderTextColor="#8a93a0"
+          value={query}
+          onChangeText={setQuery}
+          onSubmitEditing={runSearch}
+          style={{
+            backgroundColor: '#111722',
+            color: '#ffffff',
+            borderRadius: 10,
+            paddingHorizontal: 12,
+            paddingVertical: 10,
+            minHeight: 44,
+          }}
+        />
+        <Pressable
+          onPress={runSearch}
+          style={{
+            minHeight: 44,
+            paddingVertical: 8,
+            paddingHorizontal: 12,
+            borderRadius: 10,
+            borderWidth: 1,
+            borderColor: query.trim() ? 'rgba(255,255,255,0.4)' : 'rgba(255,255,255,0.15)',
+            alignSelf: 'flex-start',
+            opacity: query.trim() ? 1 : 0.6,
+            justifyContent: 'center',
+          }}
+          disabled={!query.trim()}
+        >
+          <Text style={{ color: '#ffffff' }}>Search</Text>
+        </Pressable>
+        {searching ? (
+          <Text style={{ color: '#b6c0cf' }}>Searching...</Text>
+        ) : (
+          <FlatList
+            data={results}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={{ gap: 8, paddingBottom: 100 }}
+            renderItem={({ item }) => (
+              <Pressable
+                onPress={() => addCard(item)}
+                style={{
+                  padding: 10,
+                  borderRadius: 10,
+                  borderWidth: 1,
+                  borderColor: 'rgba(255,255,255,0.15)',
+                }}
+              >
+                <Text style={{ color: '#ffffff', fontSize: 14 }}>{item.name}</Text>
+                <Text style={{ color: '#9aa4b2', fontSize: 12 }}>{item.type_line}</Text>
               </Pressable>
             )}
-            ListEmptyComponent={
-              <Text style={{ color: '#9aa4b2' }}>Nessun risultato.</Text>
-            }
+            ListEmptyComponent={<Text style={{ color: '#9aa4b2' }}>Nessun risultato.</Text>}
           />
-      )}
-    </View>
+        )}
+      </View>
+      <DeckBottomBar />
+    </SafeAreaView>
   );
 }

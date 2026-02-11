@@ -36,6 +36,20 @@ export async function getCachedImageUri(card) {
   return fileUri;
 }
 
+export async function ensureCardImage(card) {
+  if (card?.image_uri) {
+    return card.image_uri;
+  }
+  try {
+    const res = await fetch(`${API_BASE}/cards/${card.id}`);
+    if (!res.ok) return null;
+    const fullCard = await res.json();
+    return getCachedImageUri(fullCard);
+  } catch {
+    return null;
+  }
+}
+
 export function normalizeCard(card, imageUri) {
   return {
     id: card.id,

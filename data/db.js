@@ -65,6 +65,18 @@ export async function listDecks() {
   return queryAll('SELECT * FROM decks ORDER BY updated_at DESC;');
 }
 
+export async function listDecksWithCommanderMeta() {
+  return queryAll(
+    `SELECT d.*,
+            c.name AS commander_name,
+            c.image_uri AS commander_image_uri,
+            c.color_identity AS commander_color_identity
+     FROM decks d
+     LEFT JOIN cards c ON c.id = d.commander_card_id
+     ORDER BY d.updated_at DESC;`
+  );
+}
+
 export async function createDeck(name) {
   const id = `deck_${Date.now()}`;
   const now = new Date().toISOString();
@@ -82,7 +94,8 @@ export async function getDeck(deckId) {
     `SELECT dc.deck_id, dc.card_id, dc.quantity, dc.is_commander, c.*
      FROM deck_cards dc
      JOIN cards c ON c.id = dc.card_id
-     WHERE dc.deck_id = ?;`,
+     WHERE dc.deck_id = ?
+     ORDER BY dc.is_commander DESC, c.name ASC;`,
     [deckId]
   );
   return { ...deck, cards: cards ?? [] };
@@ -91,6 +104,16 @@ export async function getDeck(deckId) {
 export async function getCard(cardId) {
   const row = await queryFirst('SELECT * FROM cards WHERE id = ?;', [cardId]);
   return row || null;
+}
+
+export async function getDeckCardById(deckId, cardId) {
+  return queryFirst(
+    `SELECT dc.deck_id, dc.card_id, dc.quantity, dc.is_commander, c.*
+     FROM deck_cards dc
+     JOIN cards c ON c.id = dc.card_id
+     WHERE dc.deck_id = ? AND dc.card_id = ?;`,
+    [deckId, cardId]
+  );
 }
 
 export async function upsertCard(card) {
@@ -149,4 +172,23 @@ export async function addCardToDeck(deckId, cardId, qty = 1) {
     new Date().toISOString(),
     deckId,
   ]);
+}
+
+export async function updateDeckCardQuantity(deckId, cardId, nextQty) {
+  if (nextQty <= 0) {
+    await exec('DELETE FROM deck_cards WHERE deck_id = ? AND card_id = ?;', [deckId, cardId]);
+  } else {
+    await exec(
+      'UPDATE deck_cards SET quantity = ? WHERE deck_id = ? AND card_id = ?;',
+      [nextQty, deckId, cardId]
+    );
+  }
+  await exec('UPDATE decks SET updated_at = ? WHERE id = ?;', [
+    new Date().toISOString(),
+    deckId,
+  ]);
+}
+
+export async function updateCardImageUri(cardId, imageUri) {
+  await exec('UPDATE cards SET image_uri = ? WHERE id = ?;', [imageUri, cardId]);
 }

@@ -1,6 +1,10 @@
-import React, { useEffect, useState } from 'react';
-import { View, Text, Pressable, FlatList } from 'react-native';
-import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useFocusEffect, useLocalSearchParams, useRouter } from 'expo-router';
+import React, { useCallback, useState } from 'react';
+import { FlatList, Pressable, Text, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import DeckBottomBar from '../../../components/decks/DeckBottomBar';
+import DeckHeader from '../../../components/decks/DeckHeader';
+import DeckCardRow from '../../../components/decks/DeckCardRow';
 import { getCard, getDeck } from '../../../data/db';
 
 export default function DeckDetailScreen() {
@@ -10,7 +14,7 @@ export default function DeckDetailScreen() {
   const [loading, setLoading] = useState(true);
   const [commander, setCommander] = useState(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     if (!deckId) return;
     setLoading(true);
     const data = await getDeck(String(deckId));
@@ -22,93 +26,95 @@ export default function DeckDetailScreen() {
       setCommander(null);
     }
     setLoading(false);
-  };
-
-  useEffect(() => {
-    load();
   }, [deckId]);
+
+  useFocusEffect(
+    useCallback(() => {
+      load();
+    }, [load])
+  );
 
   const totalCards = deck?.cards?.reduce((sum, c) => sum + (c.quantity || 0), 0) ?? 0;
   const nonCommanderCards =
     deck?.cards?.filter((c) => !c.is_commander).reduce((sum, c) => sum + c.quantity, 0) ?? 0;
 
   return (
-    <View style={{ flex: 1, backgroundColor: '#0b0d10', padding: 20 }}>
-      <Pressable onPress={() => router.back()} style={{ marginBottom: 12 }}>
-        <Text style={{ color: '#9aa4b2' }}>Back</Text>
-      </Pressable>
-      {loading || !deck ? (
-        <Text style={{ color: '#b6c0cf' }}>Loading…</Text>
-      ) : (
-        <>
-          <Text style={{ color: '#ffffff', fontSize: 22, fontWeight: '600' }}>{deck.name}</Text>
-          <Text style={{ color: '#9aa4b2', marginTop: 6 }}>
-            Total: {totalCards} • Non‑Commander: {nonCommanderCards}
-          </Text>
-          <Text style={{ color: '#9aa4b2', marginTop: 6 }}>
-            Commander: {commander?.name ?? 'None'}
-          </Text>
-          {!commander ? (
-            <Text style={{ color: '#ffb347', marginTop: 6 }}>
-              Set a Commander to unlock card validation.
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0d10' }} edges={['top', 'left', 'right']}>
+      <View style={{ flex: 1, paddingHorizontal: 20 }}>
+        <DeckHeader
+          title={loading || !deck ? 'Deck' : deck.name}
+          subtitle={
+            loading || !deck
+              ? undefined
+              : `Total ${totalCards} • Non-Commander ${nonCommanderCards}`
+          }
+        />
+        {loading || !deck ? (
+          <Text style={{ color: '#b6c0cf' }}>Loading...</Text>
+        ) : (
+          <>
+            <Text style={{ color: '#9aa4b2', marginTop: 2 }}>
+              Commander: {commander?.name ?? 'None'}
             </Text>
-          ) : null}
-          <Pressable
-            onPress={() => router.push(`/(tabs)/decks/search?deckId=${deck.id}&mode=commander`)}
-            style={{
-              marginTop: 10,
-              paddingVertical: 8,
-              paddingHorizontal: 12,
-              borderRadius: 10,
-              borderWidth: 1,
-              borderColor: 'rgba(255,255,255,0.4)',
-              alignSelf: 'flex-start',
-            }}
-          >
-            <Text style={{ color: '#ffffff' }}>Set Commander</Text>
-          </Pressable>
-          <Pressable
-            onPress={() => router.push(`/(tabs)/decks/search?deckId=${deck.id}`)}
-            style={{
-              marginTop: 12,
-              paddingVertical: 8,
-              paddingHorizontal: 12,
-              borderRadius: 10,
-              borderWidth: 1,
-              borderColor: 'rgba(255,255,255,0.4)',
-              alignSelf: 'flex-start',
-            }}
-          >
-            <Text style={{ color: '#ffffff' }}>Search & Add Cards</Text>
-          </Pressable>
-          <FlatList
-            data={deck.cards ?? []}
-            keyExtractor={(item) => item.card_id}
-            contentContainerStyle={{ paddingVertical: 16, gap: 8 }}
-            renderItem={({ item }) => (
-              <View
+            {!commander ? (
+              <Text style={{ color: '#ffb347', marginTop: 6 }}>
+                Set a Commander to unlock card validation.
+              </Text>
+            ) : null}
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
+              <Pressable
+                onPress={() => router.push(`/(tabs)/decks/search?deckId=${deck.id}&mode=commander`)}
                 style={{
-                  padding: 12,
-                  borderRadius: 12,
+                  minHeight: 44,
+                  paddingVertical: 8,
+                  paddingHorizontal: 12,
+                  borderRadius: 10,
                   borderWidth: 1,
-                  borderColor: 'rgba(255,255,255,0.1)',
-                  backgroundColor: 'rgba(255,255,255,0.03)',
+                  borderColor: 'rgba(255,255,255,0.4)',
+                  justifyContent: 'center',
                 }}
               >
-                <Text style={{ color: '#ffffff', fontSize: 15 }}>
-                  {item.name} ×{item.quantity}
+                <Text style={{ color: '#ffffff' }}>Set Commander</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => router.push(`/(tabs)/decks/search?deckId=${deck.id}`)}
+                style={{
+                  minHeight: 44,
+                  paddingVertical: 8,
+                  paddingHorizontal: 12,
+                  borderRadius: 10,
+                  borderWidth: 1,
+                  borderColor: 'rgba(255,255,255,0.4)',
+                  justifyContent: 'center',
+                }}
+              >
+                <Text style={{ color: '#ffffff' }}>Search & Add Cards</Text>
+              </Pressable>
+            </View>
+            <FlatList
+              data={deck.cards ?? []}
+              keyExtractor={(item) => item.card_id}
+              contentContainerStyle={{ paddingVertical: 16, gap: 8, paddingBottom: 100 }}
+              renderItem={({ item }) => (
+                <DeckCardRow
+                  name={item.name}
+                  typeLine={item.type_line}
+                  quantity={item.quantity}
+                  onPress={() =>
+                    router.push(`/(tabs)/decks/card/${item.card_id}?deckId=${deck.id}`)
+                  }
+                />
+              )}
+              ListEmptyComponent={
+                <Text style={{ color: '#9aa4b2' }}>
+                  Nessuna carta ancora. Usa Search & Add Cards.
                 </Text>
-                <Text style={{ color: '#9aa4b2', fontSize: 12 }}>{item.type_line}</Text>
-              </View>
-            )}
-            ListEmptyComponent={
-              <Text style={{ color: '#9aa4b2' }}>
-                Nessuna carta ancora. Usa “Search & Add Cards”.
-              </Text>
-            }
-          />
-        </>
-      )}
-    </View>
+              }
+            />
+          </>
+        )}
+      </View>
+      <DeckBottomBar />
+    </SafeAreaView>
   );
 }
