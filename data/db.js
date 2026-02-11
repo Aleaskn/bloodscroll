@@ -1,7 +1,7 @@
 import { openDatabaseSync } from 'expo-sqlite';
 
 const DB_NAME = 'bloodscroll.db';
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const db = openDatabaseSync(DB_NAME);
 
@@ -15,6 +15,12 @@ async function queryAll(sql, params = []) {
 
 async function queryFirst(sql, params = []) {
   return db.getFirstAsync(sql, params);
+}
+
+function isPlaceholderDeckName(name) {
+  const trimmed = (name ?? '').trim();
+  if (!trimmed) return true;
+  return /^new deck(\s+\d+)?$/i.test(trimmed);
 }
 
 export async function initDb() {
@@ -43,6 +49,7 @@ export async function initDb() {
         cmc REAL,
         legal_commander INTEGER,
         image_uri TEXT,
+        art_image_uri TEXT,
         set_code TEXT,
         collector_number TEXT
       );`
@@ -57,6 +64,15 @@ export async function initDb() {
       );`
     );
     await exec('CREATE INDEX IF NOT EXISTS idx_deck_cards_deck ON deck_cards(deck_id);');
+    await exec('PRAGMA user_version = 1;');
+  }
+
+  if (currentVersion < 2) {
+    try {
+      await exec('ALTER TABLE cards ADD COLUMN art_image_uri TEXT;');
+    } catch {
+      // Column already exists.
+    }
     await exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
   }
 }
@@ -70,6 +86,7 @@ export async function listDecksWithCommanderMeta() {
     `SELECT d.*,
             c.name AS commander_name,
             c.image_uri AS commander_image_uri,
+            c.art_image_uri AS commander_art_image_uri,
             c.color_identity AS commander_color_identity
      FROM decks d
      LEFT JOIN cards c ON c.id = d.commander_card_id
@@ -80,11 +97,12 @@ export async function listDecksWithCommanderMeta() {
 export async function createDeck(name) {
   const id = `deck_${Date.now()}`;
   const now = new Date().toISOString();
+  const finalName = (name ?? '').trim();
   await exec(
     'INSERT INTO decks (id, name, commander_card_id, created_at, updated_at) VALUES (?, ?, NULL, ?, ?);',
-    [id, name, now, now]
+    [id, finalName, now, now]
   );
-  return { id, name, commander_card_id: null, created_at: now, updated_at: now };
+  return { id, name: finalName, commander_card_id: null, created_at: now, updated_at: now };
 }
 
 export async function getDeck(deckId) {
@@ -119,8 +137,8 @@ export async function getDeckCardById(deckId, cardId) {
 export async function upsertCard(card) {
   await exec(
     `INSERT OR REPLACE INTO cards
-      (id, name, mana_cost, type_line, oracle_text, colors, color_identity, cmc, legal_commander, image_uri, set_code, collector_number)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
+      (id, name, mana_cost, type_line, oracle_text, colors, color_identity, cmc, legal_commander, image_uri, art_image_uri, set_code, collector_number)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`,
     [
       card.id,
       card.name,
@@ -132,6 +150,7 @@ export async function upsertCard(card) {
       card.cmc ?? null,
       card.legal_commander ?? 0,
       card.image_uri ?? null,
+      card.art_image_uri ?? null,
       card.set_code ?? null,
       card.collector_number ?? null,
     ]
@@ -140,8 +159,12 @@ export async function upsertCard(card) {
 
 export async function setCommander(deckId, card) {
   await upsertCard(card);
-  await exec('UPDATE decks SET commander_card_id = ?, updated_at = ? WHERE id = ?;', [
+  const deck = await queryFirst('SELECT name FROM decks WHERE id = ?;', [deckId]);
+  const shouldAutoname = isPlaceholderDeckName(deck?.name);
+  const nextName = shouldAutoname ? card.name : deck?.name;
+  await exec('UPDATE decks SET commander_card_id = ?, name = ?, updated_at = ? WHERE id = ?;', [
     card.id,
+    nextName,
     new Date().toISOString(),
     deckId,
   ]);
@@ -149,6 +172,14 @@ export async function setCommander(deckId, card) {
     'INSERT OR REPLACE INTO deck_cards (deck_id, card_id, quantity, is_commander) VALUES (?, ?, ?, 1);',
     [deckId, card.id, 1]
   );
+}
+
+export async function renameDeck(deckId, name) {
+  await exec('UPDATE decks SET name = ?, updated_at = ? WHERE id = ?;', [
+    (name ?? '').trim(),
+    new Date().toISOString(),
+    deckId,
+  ]);
 }
 
 export async function addCardToDeck(deckId, cardId, qty = 1) {

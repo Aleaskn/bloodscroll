@@ -3,7 +3,7 @@ import { View, Text, Pressable, FlatList, TextInput } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { addCardToDeck, getCard, getDeck, setCommander, upsertCard } from '../../../data/db';
-import { getCachedImageUri, normalizeCard, searchCards } from '../../../data/scryfall';
+import { getCachedArtImageUri, getCachedImageUri, normalizeCard, searchCards } from '../../../data/scryfall';
 import DeckHeader from '../../../components/decks/DeckHeader';
 import DeckBottomBar from '../../../components/decks/DeckBottomBar';
 
@@ -67,7 +67,8 @@ export default function CardSearchScreen() {
         return;
       }
       const imageUri = await getCachedImageUri(card);
-      const normalized = normalizeCard(card, imageUri);
+      const artImageUri = await getCachedArtImageUri(card);
+      const normalized = normalizeCard(card, imageUri, artImageUri);
       await upsertCard(normalized);
       await setCommander(String(deckId), normalized);
       router.replace(`/(tabs)/decks/${String(deckId)}`);
@@ -97,7 +98,8 @@ export default function CardSearchScreen() {
     }
 
     const imageUri = await getCachedImageUri(card);
-    const normalized = normalizeCard(card, imageUri);
+    const artImageUri = await getCachedArtImageUri(card);
+    const normalized = normalizeCard(card, imageUri, artImageUri);
     await upsertCard(normalized);
     await addCardToDeck(String(deckId), normalized.id, 1);
     setDeck((prev) => {

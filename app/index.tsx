@@ -2,6 +2,7 @@ import { useRouter } from 'expo-router';
 import React from 'react';
 import { Pressable, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { Ionicons } from '@expo/vector-icons';
 
 export default function HomeSelectorScreen() {
   const router = useRouter();
@@ -9,7 +10,24 @@ export default function HomeSelectorScreen() {
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0d10' }}>
       <View style={{ flex: 1, padding: 20, justifyContent: 'center', gap: 16 }}>
-        <Text style={{ color: '#ffffff', fontSize: 30, fontWeight: '700' }}>Bloodscroll</Text>
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+          <Text style={{ color: '#ffffff', fontSize: 30, fontWeight: '700' }}>Bloodscroll</Text>
+          <Pressable
+            onPress={() => router.push('/settings')}
+            style={{
+              minWidth: 44,
+              minHeight: 44,
+              alignItems: 'center',
+              justifyContent: 'center',
+              borderRadius: 12,
+              borderWidth: 1,
+              borderColor: 'rgba(255,255,255,0.25)',
+              backgroundColor: 'rgba(255,255,255,0.03)',
+            }}
+          >
+            <Ionicons name="settings-outline" size={22} color="#ffffff" />
+          </Pressable>
+        </View>
         <Text style={{ color: '#9aa4b2', fontSize: 16 }}>
           Scegli la sezione da aprire
         </Text>
