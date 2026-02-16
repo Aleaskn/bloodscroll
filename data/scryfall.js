@@ -30,6 +30,10 @@ async function fetchCardById(cardId) {
   return res.json();
 }
 
+export async function getCardById(cardId) {
+  return fetchCardById(cardId);
+}
+
 export async function searchCards(query) {
   const url = `${API_BASE}/cards/search?q=${encodeURIComponent(query)}&unique=cards`;
   const res = await fetch(url);

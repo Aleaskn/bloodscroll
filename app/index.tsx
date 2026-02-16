@@ -59,6 +59,20 @@ export default function HomeSelectorScreen() {
           <Text style={{ color: '#ffffff', fontSize: 20, fontWeight: '600' }}>Decks</Text>
           <Text style={{ color: '#9aa4b2', marginTop: 6 }}>Commander deck builder</Text>
         </Pressable>
+        <Pressable
+          onPress={() => router.push('/search')}
+          style={{
+            borderRadius: 16,
+            paddingVertical: 18,
+            paddingHorizontal: 16,
+            borderWidth: 1,
+            borderColor: 'rgba(255,255,255,0.2)',
+            backgroundColor: 'rgba(255,255,255,0.04)',
+          }}
+        >
+          <Text style={{ color: '#ffffff', fontSize: 20, fontWeight: '600' }}>Search</Text>
+          <Text style={{ color: '#9aa4b2', marginTop: 6 }}>Scryfall card explorer</Text>
+        </Pressable>
       </View>
     </SafeAreaView>
   );
