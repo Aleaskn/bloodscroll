@@ -5,6 +5,7 @@ import styled from "styled-components/native";
 export default function MenuModal({
   visible,
   onClose,
+  onHome,
   onReset,
   onChangePlayers,
   soundEnabled,
@@ -18,6 +19,9 @@ export default function MenuModal({
         <Pressable style={{ flex: 1 }} onPress={onClose} />
         <Sheet>
           <SheetTitle>Game Menu</SheetTitle>
+          <ActionButton onPress={onHome}>
+            <ActionText>Home</ActionText>
+          </ActionButton>
           <ActionButton onPress={onDecks}>
             <ActionText>Decks</ActionText>
           </ActionButton>

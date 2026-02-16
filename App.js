@@ -9,6 +9,7 @@ import { useRouter } from "expo-router";
 import PlayerCard from "./components/PlayerCard";
 import SetupScreen from "./components/SetupScreen";
 import MenuModal from "./components/MenuModal";
+import { loadLifeSession, saveLifeSession } from "./data/lifeSession";
 
 const initialState = {
   playerCount: 4,
@@ -94,6 +95,66 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
+function normalizePlayers(rawPlayers, fallbackCount = 4) {
+  if (!Array.isArray(rawPlayers) || !rawPlayers.length) return [];
+
+  const count = clamp(rawPlayers.length, 2, 6);
+  const fallback = buildPlayers(Math.max(fallbackCount, count));
+  const ids = rawPlayers.map((player, index) => String(player?.id ?? index + 1));
+
+  return rawPlayers.map((player, index) => {
+    const base = fallback[index];
+    const playerId = ids[index];
+    const normalizedDamage = {};
+
+    ids.forEach((id, idIndex) => {
+      if (id === playerId) return;
+      const rawValue = Number(player?.commanderDamage?.[id]);
+      const fallbackValue = base.commanderDamage?.[id] ?? 0;
+      normalizedDamage[id] = clamp(
+        Number.isFinite(rawValue) ? rawValue : fallbackValue,
+        0,
+        21
+      );
+    });
+
+    return withLoss({
+      ...base,
+      id: playerId,
+      name: typeof player?.name === "string" && player.name.trim() ? player.name : "Player name",
+      life: clamp(Number(player?.life) || 0, 0, Infinity),
+      poison: clamp(Number(player?.poison) || 0, 0, 10),
+      tax: clamp(Number(player?.tax) || 0, 0, Infinity),
+      energy: clamp(Number(player?.energy) || 0, 0, Infinity),
+      accent: typeof player?.accent === "string" ? player.accent : base.accent,
+      cardColor: typeof player?.cardColor === "string" ? player.cardColor : base.cardColor,
+      commanderDamage: normalizedDamage,
+    });
+  });
+}
+
+function normalizeSession(rawSession) {
+  if (!rawSession || typeof rawSession !== "object") return null;
+
+  const rawCount = Number(rawSession.playerCount);
+  const playerCount = clamp(Number.isFinite(rawCount) ? rawCount : 4, 2, 6);
+  const players = normalizePlayers(rawSession.players, playerCount);
+  const hasPlayers = players.length > 0;
+
+  return {
+    playerCount: hasPlayers ? players.length : playerCount,
+    players,
+    showSetup:
+      typeof rawSession.showSetup === "boolean"
+        ? rawSession.showSetup
+        : !hasPlayers,
+    soundEnabled:
+      typeof rawSession.soundEnabled === "boolean"
+        ? rawSession.soundEnabled
+        : true,
+  };
+}
+
 function reducer(state, action) {
   switch (action.type) {
     case "SET_COUNT":
@@ -110,6 +171,12 @@ function reducer(state, action) {
       return { ...state, soundEnabled: !state.soundEnabled };
     case "TOGGLE_MENU":
       return { ...state, menuOpen: !state.menuOpen };
+    case "HYDRATE_SESSION":
+      return {
+        ...state,
+        ...action.payload,
+        menuOpen: false,
+      };
     case "RESET_MATCH":
       const colors = shuffle(CARD_COLORS);
       return {
@@ -220,11 +287,49 @@ export default function App() {
   useKeepAwake();
   const router = useRouter();
   const [state, dispatch] = useReducer(reducer, initialState);
+  const [isHydrated, setIsHydrated] = useState(false);
   const rows = useMemo(() => buildRows(state.playerCount), [state.playerCount]);
   const prevPlayersRef = useRef(state.players);
   const lastSfxRef = useRef(null);
   const [highrollOpen, setHighrollOpen] = useState(false);
   const [highrollResults, setHighrollResults] = useState([]);
+
+  useEffect(() => {
+    let mounted = true;
+
+    (async () => {
+      const session = await loadLifeSession();
+      if (!mounted) return;
+
+      const normalized = normalizeSession(session);
+      if (normalized) {
+        dispatch({ type: "HYDRATE_SESSION", payload: normalized });
+      }
+      setIsHydrated(true);
+    })();
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isHydrated) return;
+
+    const payload = {
+      playerCount: state.playerCount,
+      players: state.players,
+      showSetup: state.showSetup,
+      soundEnabled: state.soundEnabled,
+    };
+    saveLifeSession(payload);
+  }, [
+    isHydrated,
+    state.playerCount,
+    state.players,
+    state.showSetup,
+    state.soundEnabled,
+  ]);
 
   useEffect(() => {
     const prevPlayers = prevPlayersRef.current;
@@ -308,6 +413,10 @@ export default function App() {
     const resolved = resolveHighroll(highrollResults);
     setHighrollResults(resolved);
   };
+
+  if (!isHydrated) {
+    return <ScreenRoot />;
+  }
 
   if (state.showSetup) {
     return (
@@ -399,6 +508,10 @@ export default function App() {
       <MenuModal
         visible={state.menuOpen}
         onClose={() => dispatch({ type: "TOGGLE_MENU" })}
+        onHome={() => {
+          dispatch({ type: "TOGGLE_MENU" });
+          router.push("/");
+        }}
         onReset={() => dispatch({ type: "RESET_MATCH" })}
         onChangePlayers={() => dispatch({ type: "OPEN_SETUP" })}
         soundEnabled={state.soundEnabled}
