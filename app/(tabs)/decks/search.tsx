@@ -2,10 +2,12 @@ import React, { useState } from 'react';
 import { View, Text, Pressable, FlatList, TextInput } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { Image } from 'expo-image';
 import { addCardToDeck, getCard, getDeck, setCommander, upsertCard } from '../../../data/db';
 import { getCachedArtImageUri, getCachedImageUri, normalizeCard, searchCards } from '../../../data/scryfall';
 import DeckHeader from '../../../components/decks/DeckHeader';
 import DeckBottomBar from '../../../components/decks/DeckBottomBar';
+import ManaSymbols, { parseManaCost } from '../../../components/decks/ManaSymbols';
 
 export default function CardSearchScreen() {
   const { deckId } = useLocalSearchParams();
@@ -182,10 +184,39 @@ export default function CardSearchScreen() {
                   borderRadius: 10,
                   borderWidth: 1,
                   borderColor: 'rgba(255,255,255,0.15)',
+                  flexDirection: 'row',
+                  gap: 10,
+                  alignItems: 'center',
                 }}
               >
-                <Text style={{ color: '#ffffff', fontSize: 14 }}>{item.name}</Text>
-                <Text style={{ color: '#9aa4b2', fontSize: 12 }}>{item.type_line}</Text>
+                <Image
+                  source={{
+                    uri:
+                      item.image_uris?.art_crop ||
+                      item.image_uris?.normal ||
+                      item.card_faces?.[0]?.image_uris?.art_crop ||
+                      item.card_faces?.[0]?.image_uris?.normal,
+                  }}
+                  style={{
+                    width: 62,
+                    height: 48,
+                    borderRadius: 8,
+                    backgroundColor: 'rgba(255,255,255,0.06)',
+                  }}
+                  contentFit="cover"
+                  contentPosition="top"
+                />
+                <View style={{ flex: 1, gap: 4 }}>
+                  <Text style={{ color: '#ffffff', fontSize: 14 }} numberOfLines={1}>
+                    {item.name}
+                  </Text>
+                  <View>
+                    <ManaSymbols tokens={parseManaCost(item.mana_cost)} size={14} gap={3} />
+                  </View>
+                  <Text style={{ color: '#9aa4b2', fontSize: 12 }} numberOfLines={1}>
+                    {item.type_line}
+                  </Text>
+                </View>
               </Pressable>
             )}
             ListEmptyComponent={<Text style={{ color: '#9aa4b2' }}>Nessun risultato.</Text>}

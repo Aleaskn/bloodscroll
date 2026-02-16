@@ -3,7 +3,9 @@ import { FlatList, Pressable, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
+import { Image } from 'expo-image';
 import { searchCards } from '../../data/scryfall';
+import ManaSymbols, { parseManaCost } from '../../components/decks/ManaSymbols';
 
 export default function SearchScreen() {
   const router = useRouter();
@@ -99,10 +101,39 @@ export default function SearchScreen() {
                   borderRadius: 10,
                   borderWidth: 1,
                   borderColor: 'rgba(255,255,255,0.15)',
+                  flexDirection: 'row',
+                  gap: 10,
+                  alignItems: 'center',
                 }}
               >
-                <Text style={{ color: '#ffffff', fontSize: 14 }}>{item.name}</Text>
-                <Text style={{ color: '#9aa4b2', fontSize: 12 }}>{item.type_line}</Text>
+                <Image
+                  source={{
+                    uri:
+                      item.image_uris?.art_crop ||
+                      item.image_uris?.normal ||
+                      item.card_faces?.[0]?.image_uris?.art_crop ||
+                      item.card_faces?.[0]?.image_uris?.normal,
+                  }}
+                  style={{
+                    width: 62,
+                    height: 48,
+                    borderRadius: 8,
+                    backgroundColor: 'rgba(255,255,255,0.06)',
+                  }}
+                  contentFit="cover"
+                  contentPosition="top"
+                />
+                <View style={{ flex: 1, gap: 4 }}>
+                  <Text style={{ color: '#ffffff', fontSize: 14 }} numberOfLines={1}>
+                    {item.name}
+                  </Text>
+                  <View>
+                    <ManaSymbols tokens={parseManaCost(item.mana_cost)} size={14} gap={3} />
+                  </View>
+                  <Text style={{ color: '#9aa4b2', fontSize: 12 }} numberOfLines={1}>
+                    {item.type_line}
+                  </Text>
+                </View>
               </Pressable>
             )}
             ListEmptyComponent={
