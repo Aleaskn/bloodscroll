@@ -512,6 +512,10 @@ export default function App() {
           dispatch({ type: "TOGGLE_MENU" });
           router.push("/");
         }}
+        onSearch={() => {
+          dispatch({ type: "TOGGLE_MENU" });
+          router.push("/search");
+        }}
         onReset={() => dispatch({ type: "RESET_MATCH" })}
         onChangePlayers={() => dispatch({ type: "OPEN_SETUP" })}
         soundEnabled={state.soundEnabled}
