@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, TextInput, View } from "react-native";
 import { Feather, FontAwesome5 } from "@expo/vector-icons";
 import styled from "styled-components/native";
@@ -17,7 +17,9 @@ export default function PlayerCard({
 }) {
   const [view, setView] = useState("main");
   const [cardSize, setCardSize] = useState({ width: 0, height: 0 });
+  const [lifeDelta, setLifeDelta] = useState(0);
   const repeatRef = useRef({ timeout: null, interval: null });
+  const lifeDeltaTimeoutRef = useRef(null);
   const longPressRef = useRef(false);
   const startRepeat = (fn) => {
     if (repeatRef.current.timeout || repeatRef.current.interval) return;
@@ -43,8 +45,30 @@ export default function PlayerCard({
       repeatRef.current.interval = null;
     }
   };
+  const updateLifeDeltaHint = (delta) => {
+    setLifeDelta((prev) => prev + delta);
+    if (lifeDeltaTimeoutRef.current) {
+      clearTimeout(lifeDeltaTimeoutRef.current);
+    }
+    lifeDeltaTimeoutRef.current = setTimeout(() => {
+      setLifeDelta(0);
+    }, 1200);
+  };
+  const adjustLifeWithHint = (delta) => {
+    onAdjustLife(delta);
+    updateLifeDeltaHint(delta);
+  };
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState(player.name);
+  useEffect(
+    () => () => {
+      if (lifeDeltaTimeoutRef.current) {
+        clearTimeout(lifeDeltaTimeoutRef.current);
+      }
+      stopRepeat();
+    },
+    []
+  );
   const isSide = rotation === 90 || rotation === 270;
   const contentWidth = cardSize.width && cardSize.height
     ? isSide
@@ -136,12 +160,12 @@ export default function PlayerCard({
 
           <LifeRow style={{ minHeight: controlSize * 1.5, marginTop: vGap }}>
             <LifeStrip
-              onPress={() => handlePress(() => onAdjustLife(-1))}
+              onPress={() => handlePress(() => adjustLifeWithHint(-1))}
               onPressIn={() => { longPressRef.current = false; }}
               onLongPress={() => {
                 longPressRef.current = true;
-                onAdjustLife(-10);
-                startRepeat(() => onAdjustLife(-10));
+                adjustLifeWithHint(-10);
+                startRepeat(() => adjustLifeWithHint(-10));
               }}
               onPressOut={stopRepeat}
               onPressCancel={stopRepeat}
@@ -149,15 +173,22 @@ export default function PlayerCard({
               <ControlText style={{ fontSize: controlFont }}>-</ControlText>
             </LifeStrip>
 
-            <LifeValue style={{ fontSize: lifeFont }}>{player.life}</LifeValue>
+            <LifeValueWrap>
+              {lifeDelta !== 0 ? (
+                <LifeDeltaHint style={{ fontSize: Math.max(12, Math.round(labelFont * 1.1)) }}>
+                  {lifeDelta > 0 ? `+${lifeDelta}` : `${lifeDelta}`}
+                </LifeDeltaHint>
+              ) : null}
+              <LifeValue style={{ fontSize: lifeFont }}>{player.life}</LifeValue>
+            </LifeValueWrap>
 
             <LifeStrip
-              onPress={() => handlePress(() => onAdjustLife(1))}
+              onPress={() => handlePress(() => adjustLifeWithHint(1))}
               onPressIn={() => { longPressRef.current = false; }}
               onLongPress={() => {
                 longPressRef.current = true;
-                onAdjustLife(10);
-                startRepeat(() => onAdjustLife(10));
+                adjustLifeWithHint(10);
+                startRepeat(() => adjustLifeWithHint(10));
               }}
               onPressOut={stopRepeat}
               onPressCancel={stopRepeat}
@@ -320,6 +351,21 @@ const LifeValue = styled.Text`
   color: #f6f8fb;
   font-size: 42px;
   font-weight: 700;
+`;
+
+const LifeValueWrap = styled.View`
+  align-items: center;
+  justify-content: center;
+  position: relative;
+`;
+
+const LifeDeltaHint = styled.Text`
+  color: #f3f5f7;
+  opacity: 0.85;
+  position: absolute;
+  top: -16px;
+  align-self: center;
+  font-weight: 600;
 `;
 
 const ControlButton = styled(Pressable)`
