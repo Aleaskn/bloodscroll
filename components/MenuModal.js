@@ -13,6 +13,7 @@ export default function MenuModal({
   onHighroll,
   onDecks,
   onSearch,
+  onScan,
 }) {
   return (
     <Modal visible={visible} transparent animationType="fade">
@@ -28,6 +29,9 @@ export default function MenuModal({
           </ActionButton>
           <ActionButton onPress={onSearch}>
             <ActionText>Search</ActionText>
+          </ActionButton>
+          <ActionButton onPress={onScan}>
+            <ActionText>Scan</ActionText>
           </ActionButton>
           <ActionButton onPress={onHighroll}>
             <ActionText>Highroll</ActionText>
