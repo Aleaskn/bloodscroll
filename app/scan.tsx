@@ -1,33 +1,24 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, FlatList, Modal, Pressable, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
 import { useFocusEffect } from '@react-navigation/native';
-import { resolveScannedCardFromOcr } from '../data/scryfall';
+import { ensureCatalogReady } from '../data/catalogDb';
+import { resolveLocalScannedCard } from '../data/catalogResolver';
+import {
+  extractCardTextOnDevice,
+  extractEditionTextOnDevice,
+  isOnDeviceOcrAvailable,
+} from '../data/ocrOnDevice';
 
-const OCR_API_KEY = process.env.EXPO_PUBLIC_OCR_SPACE_API_KEY || 'helloworld';
-const OCR_SCAN_INTERVAL_MS = 1800;
-const NOT_FOUND_HINT_DELAY_MS = 12000;
+const OCR_SCAN_INTERVAL_MS = 1400;
+const NOT_FOUND_HINT_DELAY_MS = 9000;
 
-async function extractTextFromImage(base64Image, language = 'eng') {
-  const form = new FormData();
-  form.append('base64Image', `data:image/jpeg;base64,${base64Image}`);
-  form.append('language', language);
-  form.append('isOverlayRequired', 'false');
-  form.append('OCREngine', '2');
-
-  const response = await fetch('https://api.ocr.space/parse/image', {
-    method: 'POST',
-    headers: {
-      apikey: OCR_API_KEY,
-    },
-    body: form,
-  });
-
-  if (!response.ok) return '';
-  const payload = await response.json();
-  return payload?.ParsedResults?.[0]?.ParsedText?.trim() ?? '';
+function formatEditionLabel(candidate) {
+  const edition = candidate?.set_code ? String(candidate.set_code).toUpperCase() : null;
+  const collector = candidate?.collector_number ? String(candidate.collector_number) : null;
+  return [edition, collector].filter(Boolean).join(' • ');
 }
 
 export default function ScanScreen() {
@@ -35,42 +26,69 @@ export default function ScanScreen() {
   const [cameraModule, setCameraModule] = useState<any>(null);
   const [cameraInstallError, setCameraInstallError] = useState('');
   const [permission, setPermission] = useState<'loading' | 'granted' | 'denied'>('loading');
+  const [catalogReady, setCatalogReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [hintText, setHintText] = useState('Point your camera at a card');
+  const [hintText, setHintText] = useState('Loading local catalog...');
+  const [candidates, setCandidates] = useState<any[]>([]);
   const CameraView = cameraModule?.CameraView;
   const cameraRef = useRef<any>(null);
   const scanningTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const navigatedRef = useRef(false);
   const firstMissAtRef = useRef<number | null>(null);
 
-  const canScan = useMemo(() => !!CameraView && !busy, [CameraView, busy]);
+  const hasCandidates = candidates.length > 0;
+  const canScan = useMemo(
+    () => !!CameraView && !busy && catalogReady && !hasCandidates,
+    [CameraView, busy, catalogReady, hasCandidates]
+  );
 
   useEffect(() => {
     let mounted = true;
-    import('expo-camera')
-      .then(async (mod) => {
+
+    const setupCatalog = async () => {
+      try {
+        const ocrReady = await isOnDeviceOcrAvailable();
+        if (!ocrReady) {
+          throw new Error('OCR on-device non disponibile. Verifica la build di sviluppo.');
+        }
+        await ensureCatalogReady();
+        if (!mounted) return;
+        setCatalogReady(true);
+        setHintText('Point your camera at a card');
+      } catch (setupError) {
+        if (!mounted) return;
+        setCatalogReady(false);
+        setHintText('Scanner unavailable');
+        setError(setupError instanceof Error ? setupError.message : 'Errore inizializzazione scanner locale.');
+      }
+    };
+
+    const setupCamera = async () => {
+      try {
+        const mod = await import('expo-camera');
         if (!mounted) return;
         setCameraModule(mod);
         setCameraInstallError('');
-        try {
-          const current = await mod.Camera.getCameraPermissionsAsync();
-          if (current.granted) {
-            setPermission('granted');
-            return;
-          }
+
+        const current = await mod.Camera.getCameraPermissionsAsync();
+        if (current.granted) {
+          setPermission('granted');
+        } else {
           const requested = await mod.Camera.requestCameraPermissionsAsync();
           setPermission(requested.granted ? 'granted' : 'denied');
-        } catch {
-          setPermission('denied');
         }
-      })
-      .catch(() => {
+      } catch {
         if (!mounted) return;
         setCameraModule(null);
         setPermission('denied');
         setCameraInstallError('Scanner camera non disponibile. Installa il modulo expo-camera.');
-      });
+      }
+    };
+
+    setupCatalog();
+    setupCamera();
+
     return () => {
       mounted = false;
     };
@@ -82,47 +100,66 @@ export default function ScanScreen() {
     scanningTimeoutRef.current = null;
   }, []);
 
-  const runOcrScan = useCallback(async () => {
+  const navigateToCard = useCallback(
+    (cardId: string) => {
+      clearScanningTimer();
+      setCandidates([]);
+      setError('');
+      setHintText('Card recognized');
+      firstMissAtRef.current = null;
+      navigatedRef.current = true;
+      router.push(`/search/card/${cardId}`);
+    },
+    [clearScanningTimer, router]
+  );
+
+  const runLocalScan = useCallback(async () => {
     if (!cameraRef.current || !canScan || navigatedRef.current) return;
     setBusy(true);
     try {
       const photo = await cameraRef.current.takePictureAsync({
-        base64: true,
-        quality: 0.45,
+        quality: 0.55,
         skipProcessing: true,
         shutterSound: false,
       });
-      if (!photo?.base64) return;
+      if (!photo?.uri) return;
 
-      const [ocrEng, ocrJpn] = await Promise.all([
-        extractTextFromImage(photo.base64, 'eng'),
-        extractTextFromImage(photo.base64, 'jpn'),
+      const [cardText, editionText] = await Promise.all([
+        extractCardTextOnDevice(photo.uri),
+        extractEditionTextOnDevice(photo.uri),
       ]);
-      const mergedText = [ocrEng, ocrJpn].filter(Boolean).join('\n');
-      if (!mergedText) return;
 
-      const card = await resolveScannedCardFromOcr(mergedText);
-      if (!card?.id) return;
+      if (!cardText && !editionText) return;
 
-      firstMissAtRef.current = null;
-      setHintText('Card recognized');
-      setError('');
-      navigatedRef.current = true;
-      router.push(`/search/card/${card.id}`);
+      const result = await resolveLocalScannedCard({
+        cardText,
+        editionText,
+      });
+
+      if (result.status === 'matched' && result.cardId) {
+        navigateToCard(String(result.cardId));
+        return;
+      }
+
+      if (result.status === 'ambiguous' && Array.isArray(result.candidates) && result.candidates.length) {
+        setCandidates(result.candidates);
+        setHintText('Multiple editions found. Select one');
+        return;
+      }
     } catch {
-      setError('Errore durante la scansione. Riprova.');
+      setError('Errore durante la scansione locale. Riprova.');
     } finally {
       setBusy(false);
     }
-  }, [canScan, router]);
+  }, [canScan, navigateToCard]);
 
   useEffect(() => {
     clearScanningTimer();
     if (!canScan || permission !== 'granted' || navigatedRef.current) return undefined;
 
     const loop = async () => {
-      await runOcrScan();
-      if (!navigatedRef.current) {
+      await runLocalScan();
+      if (!navigatedRef.current && candidates.length === 0) {
         if (firstMissAtRef.current == null) {
           firstMissAtRef.current = Date.now();
         }
@@ -138,22 +175,21 @@ export default function ScanScreen() {
 
     scanningTimeoutRef.current = setTimeout(loop, 500);
     return clearScanningTimer;
-  }, [canScan, permission, clearScanningTimer, runOcrScan]);
+  }, [canScan, candidates.length, clearScanningTimer, permission, runLocalScan]);
 
-  useEffect(() => {
-    return clearScanningTimer;
-  }, [clearScanningTimer]);
+  useEffect(() => clearScanningTimer, [clearScanningTimer]);
 
   useFocusEffect(
     useCallback(() => {
       navigatedRef.current = false;
       firstMissAtRef.current = null;
+      setCandidates([]);
       setError('');
-      setHintText('Point your camera at a card');
+      if (catalogReady) setHintText('Point your camera at a card');
       return () => {
         clearScanningTimer();
       };
-    }, [clearScanningTimer])
+    }, [catalogReady, clearScanningTimer])
   );
 
   return (
@@ -184,9 +220,7 @@ export default function ScanScreen() {
         {!CameraView ? (
           <View style={{ gap: 12 }}>
             <Text style={{ color: '#ffb5b5' }}>{cameraInstallError}</Text>
-            <Text style={{ color: '#9aa4b2', fontSize: 12 }}>
-              Esegui: npx expo install expo-camera
-            </Text>
+            <Text style={{ color: '#9aa4b2', fontSize: 12 }}>Esegui: npx expo install expo-camera</Text>
           </View>
         ) : permission === 'loading' ? (
           <View style={{ alignItems: 'center', justifyContent: 'center', paddingVertical: 40 }}>
@@ -260,6 +294,19 @@ export default function ScanScreen() {
                 />
                 <View
                   style={{
+                    position: 'absolute',
+                    left: '14%',
+                    bottom: '23%',
+                    width: '28%',
+                    aspectRatio: 1.8,
+                    borderRadius: 8,
+                    borderWidth: 2,
+                    borderColor: 'rgba(255,255,255,0.75)',
+                    backgroundColor: 'rgba(255,255,255,0.08)',
+                  }}
+                />
+                <View
+                  style={{
                     marginTop: 14,
                     borderWidth: 1,
                     borderColor: 'rgba(255,255,255,0.45)',
@@ -269,9 +316,13 @@ export default function ScanScreen() {
                     backgroundColor: 'rgba(10,12,16,0.75)',
                     minWidth: 260,
                     maxWidth: '82%',
+                    gap: 4,
                   }}
                 >
                   <Text style={{ color: '#d8dde5', fontSize: 14, textAlign: 'center' }}>{hintText}</Text>
+                  <Text style={{ color: '#9aa4b2', fontSize: 11, textAlign: 'center' }}>
+                    OCR title + edition code (bottom-left)
+                  </Text>
                 </View>
               </View>
             </View>
@@ -279,6 +330,78 @@ export default function ScanScreen() {
           </View>
         )}
       </View>
+
+      <Modal visible={hasCandidates} transparent animationType="fade" onRequestClose={() => setCandidates([])}>
+        <View
+          style={{
+            flex: 1,
+            backgroundColor: 'rgba(0,0,0,0.72)',
+            justifyContent: 'center',
+            paddingHorizontal: 20,
+            paddingVertical: 24,
+          }}
+        >
+          <View
+            style={{
+              borderRadius: 16,
+              borderWidth: 1,
+              borderColor: 'rgba(255,255,255,0.25)',
+              backgroundColor: '#121722',
+              padding: 14,
+              maxHeight: '78%',
+              gap: 10,
+            }}
+          >
+            <Text style={{ color: '#ffffff', fontSize: 18, fontWeight: '700' }}>Select Card Edition</Text>
+            <Text style={{ color: '#9aa4b2', fontSize: 13 }}>
+              OCR found multiple candidates. Choose the exact printing.
+            </Text>
+            <FlatList
+              data={candidates}
+              keyExtractor={(item, index) => `${item.id}-${item.set_code}-${item.collector_number}-${index}`}
+              contentContainerStyle={{ gap: 8, paddingVertical: 4 }}
+              renderItem={({ item }) => (
+                <Pressable
+                  onPress={() => navigateToCard(String(item.id))}
+                  style={{
+                    borderRadius: 10,
+                    borderWidth: 1,
+                    borderColor: 'rgba(255,255,255,0.18)',
+                    paddingHorizontal: 12,
+                    paddingVertical: 10,
+                    backgroundColor: 'rgba(255,255,255,0.03)',
+                  }}
+                >
+                  <Text style={{ color: '#ffffff', fontSize: 14 }} numberOfLines={1}>
+                    {item.name}
+                  </Text>
+                  <Text style={{ color: '#9aa4b2', fontSize: 12, marginTop: 4 }} numberOfLines={1}>
+                    {formatEditionLabel(item)}
+                  </Text>
+                </Pressable>
+              )}
+            />
+            <Pressable
+              onPress={() => {
+                setCandidates([]);
+                firstMissAtRef.current = Date.now();
+                setHintText('Point your camera at a card');
+              }}
+              style={{
+                minHeight: 44,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor: 'rgba(255,255,255,0.35)',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <Text style={{ color: '#ffffff' }}>Continue scanning</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
+

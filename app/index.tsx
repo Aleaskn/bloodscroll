@@ -85,7 +85,9 @@ export default function HomeSelectorScreen() {
           }}
         >
           <Text style={{ color: '#ffffff', fontSize: 20, fontWeight: '600' }}>Scan</Text>
-          <Text style={{ color: '#9aa4b2', marginTop: 6 }}>Scan QR / barcode to open card detail</Text>
+          <Text style={{ color: '#9aa4b2', marginTop: 6 }}>
+            On-device OCR scan with local card catalog
+          </Text>
         </Pressable>
       </View>
     </SafeAreaView>
