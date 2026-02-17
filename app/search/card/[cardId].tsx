@@ -6,6 +6,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { Image } from 'expo-image';
 import ManaSymbols, { parseManaCost } from '../../../components/decks/ManaSymbols';
 import { getCardById, getCachedCardFaces, getCachedImageUri } from '../../../data/scryfall';
+import { getCatalogCardById } from '../../../data/catalogDb';
 
 function buildPrimaryFace(card) {
   return {
@@ -26,6 +27,7 @@ export default function SearchCardDetailScreen() {
   const { cardId } = useLocalSearchParams();
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [offlineNotice, setOfflineNotice] = useState('');
   const [card, setCard] = useState<any>(null);
   const [faces, setFaces] = useState<any[]>([]);
   const [activeFaceIndex, setActiveFaceIndex] = useState(0);
@@ -38,28 +40,55 @@ export default function SearchCardDetailScreen() {
       if (!cardId) return;
       setLoading(true);
       setError('');
+      setOfflineNotice('');
       try {
-        const fullCard = await getCardById(String(cardId));
-        if (!mounted || !fullCard) {
-          setError('Carta non trovata.');
-          setLoading(false);
+        let fullCard = null;
+        try {
+          fullCard = await getCardById(String(cardId));
+        } catch {
+          fullCard = null;
+        }
+
+        if (fullCard) {
+          const cachedPrimary = await getCachedImageUri(fullCard);
+          const primaryFace = {
+            ...buildPrimaryFace(fullCard),
+            image_uri: cachedPrimary || buildPrimaryFace(fullCard).image_uri,
+          };
+
+          const cachedFaces = await getCachedCardFaces(String(cardId));
+          if (cachedFaces.length > 1) {
+            setFaces(cachedFaces);
+          } else {
+            setFaces([primaryFace]);
+          }
+          setCard(fullCard);
+          setActiveFaceIndex(0);
           return;
         }
 
-        const cachedPrimary = await getCachedImageUri(fullCard);
-        const primaryFace = {
-          ...buildPrimaryFace(fullCard),
-          image_uri: cachedPrimary || buildPrimaryFace(fullCard).image_uri,
+        const localCard = await getCatalogCardById(String(cardId));
+        if (!localCard) {
+          if (mounted) setError('Carta non trovata.');
+          return;
+        }
+
+        const offlineFace = {
+          name: localCard.name,
+          type_line: localCard.type_line ?? '',
+          oracle_text: '',
+          mana_cost: localCard.mana_cost ?? '',
+          image_uri: null,
+          color_identity: [],
         };
 
-        const cachedFaces = await getCachedCardFaces(String(cardId));
-        if (cachedFaces.length > 1) {
-          setFaces(cachedFaces);
-        } else {
-          setFaces([primaryFace]);
-        }
-        setCard(fullCard);
+        setCard({
+          ...localCard,
+          color_identity: [],
+        });
+        setFaces([offlineFace]);
         setActiveFaceIndex(0);
+        setOfflineNotice('Modalità offline: dettagli ridotti, immagine non disponibile.');
       } catch {
         if (mounted) setError('Errore durante il caricamento della carta.');
       } finally {
@@ -74,6 +103,12 @@ export default function SearchCardDetailScreen() {
 
   const activeFace = faces[activeFaceIndex];
   const manaTokens = useMemo(() => parseManaCost(activeFace?.mana_cost), [activeFace?.mana_cost]);
+  const editionLabel = useMemo(() => {
+    const setCode = card?.set ?? card?.set_code;
+    const collector = card?.collector_number;
+    if (!setCode && !collector) return '';
+    return [setCode ? String(setCode).toUpperCase() : null, collector].filter(Boolean).join(' • ');
+  }, [card?.collector_number, card?.set, card?.set_code]);
   const identityTokens = useMemo(
     () =>
       Array.isArray(card?.color_identity)
@@ -116,6 +151,9 @@ export default function SearchCardDetailScreen() {
           <Text style={{ color: '#ff8a8a', marginTop: 12 }}>{error}</Text>
         ) : (
           <ScrollView contentContainerStyle={{ paddingBottom: 28 }}>
+            {offlineNotice ? (
+              <Text style={{ color: '#f0c674', marginTop: 10 }}>{offlineNotice}</Text>
+            ) : null}
             <View style={{ marginTop: 10 }}>
               <ScrollView
                 horizontal
@@ -171,6 +209,9 @@ export default function SearchCardDetailScreen() {
               {activeFace?.name}
             </Text>
             <Text style={{ color: '#9aa4b2', marginTop: 4 }}>{activeFace?.type_line}</Text>
+            {editionLabel ? (
+              <Text style={{ color: '#9aa4b2', marginTop: 4, fontSize: 12 }}>{editionLabel}</Text>
+            ) : null}
             {manaTokens.length ? (
               <View style={{ marginTop: 8 }}>
                 <ManaSymbols tokens={manaTokens} size={18} gap={4} />
