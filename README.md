@@ -16,6 +16,35 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
    npx expo start
    ```
 
+## Local MTG scanner (offline-first)
+
+The scanner now uses:
+
+- on-device OCR (`@react-native-ml-kit/text-recognition`)
+- local SQLite catalog (`assets/catalog/cards-catalog.db`)
+- Scryfall only for detail/image enrichment after a match
+
+### Important runtime note
+
+On-device OCR requires a Development Build (custom dev client). Expo Go is not sufficient.
+
+### Build / refresh local catalog
+
+```bash
+npm run catalog:build
+```
+
+This command generates:
+
+- `assets/catalog/cards-catalog.db`
+- `assets/catalog/catalog-manifest.local.json`
+
+If you provide a local Scryfall bulk JSON:
+
+```bash
+node scripts/build-catalog-db.mjs --input /path/to/default_cards.json
+```
+
 In the output, you'll find options to open the app in a
 
 - [development build](https://docs.expo.dev/develop/development-builds/introduction/)
