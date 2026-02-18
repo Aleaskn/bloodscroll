@@ -18,15 +18,22 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
 
 ## Local MTG scanner (offline-first)
 
-The scanner now uses:
+The scanner supports two engines in `Settings`:
 
-- on-device OCR (`@react-native-ml-kit/text-recognition`)
-- local SQLite catalog (`assets/catalog/cards-catalog.db`)
-- Scryfall only for detail/image enrichment after a match
+- `Legacy OCR`: OCR-only matching (fallback mode).
+- `Hybrid Hash (Beta)`: image fingerprint first (`pHash/dHash`) + OCR footer disambiguation.
 
-### Important runtime note
+Runtime architecture for hybrid:
 
-On-device OCR requires a Development Build (custom dev client). Expo Go is not sufficient.
+1. Capture card frame.
+2. Build artwork fingerprint locally.
+3. Query local SQLite shortlist (`catalog_card_fingerprint`).
+4. Disambiguate with footer OCR (`set_code + collector_number`).
+5. Auto-open only after confidence + stability gate.
+
+### Dev build requirement
+
+Scanner native modules require a Development Build (custom dev client). Expo Go is not enough.
 
 ### Build / refresh local catalog
 
@@ -34,16 +41,31 @@ On-device OCR requires a Development Build (custom dev client). Expo Go is not s
 npm run catalog:build
 ```
 
-This command generates:
+Generated assets:
 
 - `assets/catalog/cards-catalog.db`
 - `assets/catalog/catalog-manifest.local.json`
 
-If you provide a local Scryfall bulk JSON:
+Build options:
 
 ```bash
+# Use an existing default_cards JSON dump
 node scripts/build-catalog-db.mjs --input /path/to/default_cards.json
+
+# Skip fingerprints (OCR-only catalog build)
+node scripts/build-catalog-db.mjs --no-fingerprints
+
+# Generate fingerprints only for first N cards (debug)
+node scripts/build-catalog-db.mjs --fingerprint-limit 5000
 ```
+
+### Scanner benchmark
+
+```bash
+npm run scan:benchmark -- 1000
+```
+
+This runs a local resolver micro-benchmark to compare average matching latency across iterations.
 
 In the output, you'll find options to open the app in a
 
