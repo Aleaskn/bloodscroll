@@ -9,6 +9,7 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
+      "deploymentTarget": "15.5",
       "supportsTablet": true,
       "bundleIdentifier": "com.aleaskn.bloodscroll"
     },
