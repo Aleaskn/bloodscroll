@@ -12,7 +12,7 @@ import { recordScanMetric } from '../data/scanMetrics';
 import { getScanSettings, SCANNER_ENGINES } from '../data/scanSettings';
 
 const LEGACY_SCAN_INTERVAL_MS = 1200;
-const HYBRID_SCAN_INTERVAL_MS = 700;
+const HYBRID_SCAN_INTERVAL_MS = 260;
 const NOT_FOUND_HINT_DELAY_MS = 9000;
 const CARD_FRAME = {
   left: 0.18,
@@ -32,7 +32,7 @@ const ARTWORK_FRAME = {
   widthInCard: 0.84,
   heightInCard: 0.46,
 };
-const DECISION_CONFIDENCE_THRESHOLD = 0.93;
+const DECISION_CONFIDENCE_THRESHOLD = 0.95;
 const DECISION_STABLE_FRAMES = 2;
 
 function formatEditionLabel(candidate) {
@@ -51,7 +51,7 @@ export default function ScanScreen() {
   const router = useRouter();
   const isFocused = useIsFocused();
   const [scanSettings, setScanSettings] = useState({
-    engine: SCANNER_ENGINES.LEGACY_OCR,
+    engine: SCANNER_ENGINES.HYBRID_HASH_BETA,
     multilingualFallback: false,
   });
   const [cameraModule, setCameraModule] = useState<any>(null);
@@ -71,7 +71,10 @@ export default function ScanScreen() {
   const hybridCameraRef = useRef<any>(null);
   const scanningTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const navigatedRef = useRef(false);
+  const pausedRef = useRef(false);
+  const hasCandidatesRef = useRef(false);
   const firstMissAtRef = useRef<number | null>(null);
+  const missStreakRef = useRef(0);
   const scanInFlightRef = useRef(false);
   const stableMatchRef = useRef<{ cardId: string; count: number }>({ cardId: '', count: 0 });
 
@@ -95,6 +98,10 @@ export default function ScanScreen() {
     clearTimeout(scanningTimeoutRef.current);
     scanningTimeoutRef.current = null;
   }, []);
+
+  useEffect(() => {
+    hasCandidatesRef.current = hasCandidates;
+  }, [hasCandidates]);
 
   const refreshScanSettings = useCallback(async () => {
     const next = await getScanSettings();
@@ -193,7 +200,9 @@ export default function ScanScreen() {
     useCallback(() => {
       void refreshScanSettings();
       navigatedRef.current = false;
+      pausedRef.current = false;
       firstMissAtRef.current = null;
+      missStreakRef.current = 0;
       stableMatchRef.current = { cardId: '', count: 0 };
       setCandidates([]);
       setError('');
@@ -207,6 +216,8 @@ export default function ScanScreen() {
   const navigateToCard = useCallback(
     (cardId: string) => {
       clearScanningTimer();
+      pausedRef.current = true;
+      missStreakRef.current = 0;
       setCandidates([]);
       setError('');
       setHintText('Matched');
@@ -256,7 +267,7 @@ export default function ScanScreen() {
   }, []);
 
   const runScanCycle = useCallback(async () => {
-    if (!canScan || navigatedRef.current || scanInFlightRef.current) return;
+    if (!canScan || pausedRef.current || navigatedRef.current || scanInFlightRef.current) return;
     scanInFlightRef.current = true;
     setBusy(true);
     const startedAt = Date.now();
@@ -267,23 +278,32 @@ export default function ScanScreen() {
       capturedUri = usingHybrid ? await captureHybridUri() : await captureLegacyUri();
       if (!capturedUri) return;
 
+      const shouldAllowOcrFallback = !usingHybrid || missStreakRef.current >= 6;
+
       const result = await processFrameAndResolveCard({
         imageUri: capturedUri,
         cardFrame: CARD_FRAME,
         editionFrameInCard: EDITION_FRAME,
         artworkFrameInCard: ARTWORK_FRAME,
         enableMultilingualFallback: scanSettings.multilingualFallback,
+        allowOcrFallback: shouldAllowOcrFallback,
       });
 
       if (result.status === 'matched' && result.cardId) {
         const confidence = Number(result.confidence ?? 0);
-        if (confidence >= DECISION_CONFIDENCE_THRESHOLD) {
+        const matchedBy = String(result.matchedBy ?? '');
+        const isFingerprintDriven =
+          matchedBy.startsWith('fingerprint') || matchedBy.includes('consensus');
+        const threshold = isFingerprintDriven ? 0.88 : DECISION_CONFIDENCE_THRESHOLD;
+        const requiredStableFrames = isFingerprintDriven ? 1 : DECISION_STABLE_FRAMES;
+        if (confidence >= threshold) {
           if (stableMatchRef.current.cardId === String(result.cardId)) {
             stableMatchRef.current.count += 1;
           } else {
             stableMatchRef.current = { cardId: String(result.cardId), count: 1 };
           }
-          if (stableMatchRef.current.count >= DECISION_STABLE_FRAMES) {
+          if (stableMatchRef.current.count >= requiredStableFrames) {
+            missStreakRef.current = 0;
             await recordScanMetric({
               engine: scanSettings.engine,
               status: 'matched',
@@ -302,6 +322,9 @@ export default function ScanScreen() {
       }
 
       if (result.status === 'ambiguous' && Array.isArray(result.candidates) && result.candidates.length) {
+        missStreakRef.current = 0;
+        pausedRef.current = true;
+        clearScanningTimer();
         await recordScanMetric({
           engine: scanSettings.engine,
           status: 'ambiguous',
@@ -322,14 +345,20 @@ export default function ScanScreen() {
         latencyMs: Date.now() - startedAt,
       });
 
+      missStreakRef.current += 1;
+
       if (firstMissAtRef.current == null) {
         firstMissAtRef.current = Date.now();
       }
       const elapsed = Date.now() - firstMissAtRef.current;
       if (elapsed >= NOT_FOUND_HINT_DELAY_MS) {
-        setHintText('Card not recognized yet. Hold steady and improve light');
+        setHintText('No confident hash match yet. Hold steady on artwork');
       } else {
-        setHintText('Point your camera at a card');
+        setHintText(
+          shouldAllowOcrFallback
+            ? 'Hash miss: OCR fallback enabled'
+            : 'Hash-first scan active (OCR fallback delayed)'
+        );
       }
       if (error) setError('');
     } catch {
@@ -343,6 +372,7 @@ export default function ScanScreen() {
     }
   }, [
     canScan,
+    clearScanningTimer,
     usingHybrid,
     captureHybridUri,
     captureLegacyUri,
@@ -354,19 +384,19 @@ export default function ScanScreen() {
 
   useEffect(() => {
     clearScanningTimer();
-    if (!canScan || navigatedRef.current) return undefined;
+    if (!canScan || pausedRef.current || navigatedRef.current) return undefined;
 
     const interval = usingHybrid ? HYBRID_SCAN_INTERVAL_MS : LEGACY_SCAN_INTERVAL_MS;
     const loop = async () => {
       await runScanCycle();
-      if (!navigatedRef.current && candidates.length === 0) {
+      if (!pausedRef.current && !navigatedRef.current && !hasCandidatesRef.current) {
         scanningTimeoutRef.current = setTimeout(loop, interval);
       }
     };
 
     scanningTimeoutRef.current = setTimeout(loop, 450);
     return clearScanningTimer;
-  }, [canScan, usingHybrid, runScanCycle, candidates.length, clearScanningTimer]);
+  }, [canScan, usingHybrid, runScanCycle, clearScanningTimer]);
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0d10' }} edges={['top', 'left', 'right', 'bottom']}>
@@ -427,7 +457,7 @@ export default function ScanScreen() {
                     ref={hybridCameraRef}
                     style={{ width: '100%', height: '100%' }}
                     device={visionDevice}
-                    isActive={isFocused}
+                    isActive={isFocused && !hasCandidates}
                     photo
                     onInitialized={() => setCameraReady(true)}
                   />
@@ -553,6 +583,8 @@ export default function ScanScreen() {
             />
             <Pressable
               onPress={() => {
+                pausedRef.current = false;
+                missStreakRef.current = 0;
                 setCandidates([]);
                 firstMissAtRef.current = Date.now();
                 setHintText('Point your camera at a card');

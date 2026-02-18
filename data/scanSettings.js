@@ -11,7 +11,7 @@ export const SCANNER_ENGINES = {
 };
 
 const DEFAULT_SETTINGS = {
-  engine: SCANNER_ENGINES.LEGACY_OCR,
+  engine: SCANNER_ENGINES.HYBRID_HASH_BETA,
   multilingualFallback: false,
 };
 

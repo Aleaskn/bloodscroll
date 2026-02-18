@@ -92,6 +92,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
   const cardFrame = frameMeta.cardFrame || {};
   const editionFrameInCard = frameMeta.editionFrameInCard || {};
   const enableMultilingualFallback = !!frameMeta.enableMultilingualFallback;
+  const allowOcrFallback = !!frameMeta.allowOcrFallback;
 
   if (!imageUri) return { status: 'none', reason: 'missing_image_uri' };
 
@@ -167,6 +168,17 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
     }
   }
 
+  if (fingerprintAmbiguous?.status === 'ambiguous' && !allowOcrFallback) {
+    return fingerprintAmbiguous;
+  }
+
+  if (!allowOcrFallback) {
+    return {
+      status: 'none',
+      reason: 'fingerprint_no_confident_match',
+    };
+  }
+
   const [titleText, cardText] = await Promise.all([
     extractCardTitleTextOnDevice(imageUri, {
       cardFrame,
@@ -207,6 +219,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
         matchedBy: 'fingerprint_ocr_conflict',
       };
     }
+
     return {
       ...ocrResult,
       evidence: {
@@ -216,6 +229,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
       },
     };
   }
+
   if (ocrResult.status === 'ambiguous') {
     if (fingerprintAmbiguous?.status === 'ambiguous') {
       const mergedCandidates = mergeAmbiguousCandidates(
@@ -237,6 +251,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
         },
       };
     }
+
     return {
       ...ocrResult,
       evidence: {
@@ -253,6 +268,6 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
 
   return {
     status: 'none',
-    reason: 'no_confident_match',
+    reason: 'no_confident_match_ocr_fallback',
   };
 }
