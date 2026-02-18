@@ -42,7 +42,7 @@ export function normalizeCatalogName(value) {
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -81,6 +81,18 @@ async function importBundledCatalogIfMissing() {
   }
 }
 
+async function importBundledCatalogForceOverwrite() {
+  await ensureCatalogDirectory();
+  try {
+    await importDatabaseFromAssetAsync(CATALOG_DB_NAME, {
+      assetId: CATALOG_ASSET_ID,
+      forceOverwrite: true,
+    });
+  } catch {
+    // noop: handled by caller through row-count checks.
+  }
+}
+
 async function ensureCatalogSchema(db) {
   await db.execAsync(
     `CREATE TABLE IF NOT EXISTS catalog_cards (
@@ -95,6 +107,28 @@ async function ensureCatalogSchema(db) {
     );
     CREATE INDEX IF NOT EXISTS idx_catalog_cards_name_norm ON catalog_cards(name_norm);
     CREATE INDEX IF NOT EXISTS idx_catalog_cards_set_collector ON catalog_cards(set_code, collector_number);
+    CREATE TABLE IF NOT EXISTS catalog_name_alias (
+      alias_norm TEXT NOT NULL,
+      card_id TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_catalog_name_alias_norm ON catalog_name_alias(alias_norm);
+    CREATE INDEX IF NOT EXISTS idx_catalog_name_alias_card ON catalog_name_alias(card_id);
+    CREATE TABLE IF NOT EXISTS catalog_card_fingerprint (
+      card_id TEXT NOT NULL,
+      set_code TEXT,
+      collector_number TEXT,
+      lang TEXT,
+      art_variant TEXT,
+      phash_hi INTEGER NOT NULL,
+      phash_lo INTEGER NOT NULL,
+      dhash_hi INTEGER NOT NULL,
+      dhash_lo INTEGER NOT NULL,
+      bucket16 INTEGER NOT NULL,
+      updated_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_fingerprint_bucket16 ON catalog_card_fingerprint(bucket16);
+    CREATE INDEX IF NOT EXISTS idx_fingerprint_set_collector ON catalog_card_fingerprint(set_code, collector_number);
+    CREATE INDEX IF NOT EXISTS idx_fingerprint_card_id ON catalog_card_fingerprint(card_id);
     CREATE TABLE IF NOT EXISTS catalog_meta (
       key TEXT PRIMARY KEY NOT NULL,
       value TEXT
@@ -115,6 +149,12 @@ async function getCatalogDb() {
   return catalogDbPromise;
 }
 
+async function getCatalogCardsCount(db) {
+  const row = await db.getFirstAsync('SELECT COUNT(1) AS count FROM catalog_cards;');
+  const count = Number(row?.count ?? 0);
+  return Number.isFinite(count) ? count : 0;
+}
+
 export async function closeCatalogDb() {
   if (!catalogDbPromise) return;
   try {
@@ -128,7 +168,19 @@ export async function closeCatalogDb() {
 }
 
 export async function ensureCatalogReady() {
-  await getCatalogDb();
+  let db = await getCatalogDb();
+  let count = await getCatalogCardsCount(db);
+  if (count > 0) return;
+
+  await closeCatalogDb();
+  await importBundledCatalogForceOverwrite();
+  db = await getCatalogDb();
+  count = await getCatalogCardsCount(db);
+  if (count > 0) return;
+
+  throw new Error(
+    'Catalogo carte vuoto. Rigenera assets/catalog/cards-catalog.db con: node scripts/build-catalog-db.mjs'
+  );
 }
 
 export async function getCatalogCardById(cardId) {
@@ -164,6 +216,72 @@ export async function findBySetCollector(setCode, collectorNumber) {
   return rows ?? [];
 }
 
+export async function searchFingerprintCandidatesByBucket(
+  bucket16,
+  { setCode = '', collectorNumber = '', limit = 80, neighborRange = 1 } = {}
+) {
+  const bucket = Number(bucket16);
+  if (!Number.isFinite(bucket)) return [];
+
+  const normalizedLimit = Math.max(1, Math.min(300, Number(limit) || 80));
+  const range = Math.max(0, Math.min(6, Number(neighborRange) || 1));
+  const bucketMin = Math.max(0, bucket - range);
+  const bucketMax = Math.min(65535, bucket + range);
+  const normalizedSet = String(setCode ?? '').trim().toLowerCase();
+  const normalizedCollector = normalizeCollectorNumber(collectorNumber);
+  const hasEditionFilter = normalizedSet || normalizedCollector;
+
+  const db = await getCatalogDb();
+  const rows = await db.getAllAsync(
+    `SELECT
+       f.card_id,
+       c.name,
+       f.set_code,
+       f.collector_number,
+       f.lang,
+       f.art_variant,
+       f.phash_hi,
+       f.phash_lo,
+       f.dhash_hi,
+       f.dhash_lo,
+       f.bucket16
+     FROM catalog_card_fingerprint f
+     JOIN catalog_cards c ON c.id = f.card_id
+     WHERE f.bucket16 BETWEEN ? AND ?
+       AND (
+         ? = 0 OR
+         ((? = '' OR f.set_code = ?) AND (? = '' OR f.collector_number = ?))
+       )
+     LIMIT ?;`,
+    [
+      bucketMin,
+      bucketMax,
+      hasEditionFilter ? 1 : 0,
+      normalizedSet,
+      normalizedSet,
+      normalizedCollector,
+      normalizedCollector,
+      normalizedLimit,
+    ]
+  );
+
+  return rows ?? [];
+}
+
+export async function getFingerprintStats() {
+  const db = await getCatalogDb();
+  const row = await db.getFirstAsync(
+    `SELECT
+       COUNT(1) AS total,
+       COUNT(DISTINCT card_id) AS unique_cards
+     FROM catalog_card_fingerprint;`
+  );
+  return {
+    total: Number(row?.total ?? 0) || 0,
+    uniqueCards: Number(row?.unique_cards ?? 0) || 0,
+  };
+}
+
 export async function searchByNameNormalized(
   name,
   { allowPrefix = true, allowContains = true, limit = 12 } = {}
@@ -183,6 +301,18 @@ export async function searchByNameNormalized(
   );
   if (exactRows?.length) return exactRows;
 
+  const aliasExactRows = await db.getAllAsync(
+    `SELECT c.id, c.name, c.set_code, c.collector_number, c.mana_cost, c.type_line, c.released_at
+     FROM catalog_name_alias a
+     JOIN catalog_cards c ON c.id = a.card_id
+     WHERE a.alias_norm = ?
+     GROUP BY c.id
+     ORDER BY c.released_at DESC
+     LIMIT ?;`,
+    [normalized, normalizedLimit]
+  );
+  if (aliasExactRows?.length) return aliasExactRows;
+
   if (allowPrefix) {
     const prefixPattern = `${escapeLike(normalized)}%`;
     const prefixRows = await db.getAllAsync(
@@ -194,6 +324,18 @@ export async function searchByNameNormalized(
       [prefixPattern, normalized, normalizedLimit]
     );
     if (prefixRows?.length) return prefixRows;
+
+    const aliasPrefixRows = await db.getAllAsync(
+      `SELECT c.id, c.name, c.set_code, c.collector_number, c.mana_cost, c.type_line, c.released_at
+       FROM catalog_name_alias a
+       JOIN catalog_cards c ON c.id = a.card_id
+       WHERE a.alias_norm LIKE ? ESCAPE '\\'
+       GROUP BY c.id
+       ORDER BY c.released_at DESC
+       LIMIT ?;`,
+      [prefixPattern, normalizedLimit]
+    );
+    if (aliasPrefixRows?.length) return aliasPrefixRows;
   }
 
   if (allowContains) {
@@ -206,7 +348,19 @@ export async function searchByNameNormalized(
        LIMIT ?;`,
       [containsPattern, normalizedLimit]
     );
-    return containsRows ?? [];
+    if (containsRows?.length) return containsRows;
+
+    const aliasContainsRows = await db.getAllAsync(
+      `SELECT c.id, c.name, c.set_code, c.collector_number, c.mana_cost, c.type_line, c.released_at
+       FROM catalog_name_alias a
+       JOIN catalog_cards c ON c.id = a.card_id
+       WHERE a.alias_norm LIKE ? ESCAPE '\\'
+       GROUP BY c.id
+       ORDER BY c.released_at DESC
+       LIMIT ?;`,
+      [containsPattern, normalizedLimit]
+    );
+    return aliasContainsRows ?? [];
   }
 
   return [];
@@ -300,4 +454,3 @@ export async function replaceCatalogDatabaseWithFile(sourceFileUri) {
     throw error;
   }
 }
-

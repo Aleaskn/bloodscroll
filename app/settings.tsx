@@ -7,6 +7,14 @@ import {
   downloadAndApplyCatalogUpdate,
   getCatalogMeta,
 } from '../data/catalogUpdate';
+import { getFingerprintStats } from '../data/catalogDb';
+import {
+  getScanSettings,
+  SCANNER_ENGINES,
+  setMultilingualFallback,
+  setScannerEngine,
+} from '../data/scanSettings';
+import { getScanMetricsSummary } from '../data/scanMetrics';
 
 function formatDate(value) {
   if (!value) return 'N/A';
@@ -15,15 +23,34 @@ function formatDate(value) {
   return date.toLocaleString();
 }
 
+function percent(value) {
+  if (value == null || Number.isNaN(Number(value))) return '0.0%';
+  return `${(Number(value) * 100).toFixed(1)}%`;
+}
+
 export default function SettingsScreen() {
   const [meta, setMeta] = useState<any>(null);
+  const [fingerprintStats, setFingerprintStats] = useState({ total: 0, uniqueCards: 0 });
+  const [scanSettings, setScanSettingsState] = useState({
+    engine: SCANNER_ENGINES.LEGACY_OCR,
+    multilingualFallback: false,
+  });
+  const [metrics, setMetrics] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
   const [message, setMessage] = useState('');
 
-  const refreshMeta = useCallback(async () => {
-    const next = await getCatalogMeta();
-    setMeta(next);
+  const refreshAll = useCallback(async () => {
+    const [catalogMeta, settings, fpStats, metricsSummary] = await Promise.all([
+      getCatalogMeta(),
+      getScanSettings(),
+      getFingerprintStats(),
+      getScanMetricsSummary({ sinceDays: 7 }),
+    ]);
+    setMeta(catalogMeta);
+    setScanSettingsState(settings);
+    setFingerprintStats(fpStats);
+    setMetrics(metricsSummary);
   }, []);
 
   useEffect(() => {
@@ -32,9 +59,7 @@ export default function SettingsScreen() {
     const load = async () => {
       setLoading(true);
       try {
-        const next = await getCatalogMeta();
-        if (!mounted) return;
-        setMeta(next);
+        await refreshAll();
       } finally {
         if (mounted) setLoading(false);
       }
@@ -44,7 +69,7 @@ export default function SettingsScreen() {
     return () => {
       mounted = false;
     };
-  }, []);
+  }, [refreshAll]);
 
   const applyUpdate = useCallback(
     async (manifestItem) => {
@@ -52,7 +77,7 @@ export default function SettingsScreen() {
       setMessage('');
       try {
         const result = await downloadAndApplyCatalogUpdate(manifestItem);
-        await refreshMeta();
+        await refreshAll();
         setMessage(`Catalog updated: ${result.version}`);
       } catch {
         setMessage('Update failed. Please retry later.');
@@ -60,7 +85,7 @@ export default function SettingsScreen() {
         setChecking(false);
       }
     },
-    [refreshMeta]
+    [refreshAll]
   );
 
   const checkNow = useCallback(async () => {
@@ -70,19 +95,15 @@ export default function SettingsScreen() {
       const result = await checkForCatalogUpdate({ force: true });
       if (result.status === 'update_available' && result.manifestItem) {
         const targetVersion = result.manifestVersion ?? result.manifestItem.version;
-        Alert.alert(
-          'Catalog update available',
-          `New version ${targetVersion} found.`,
-          [
-            { text: 'Cancel', style: 'cancel' },
-            {
-              text: 'Download',
-              onPress: () => {
-                void applyUpdate(result.manifestItem);
-              },
+        Alert.alert('Catalog update available', `New version ${targetVersion} found.`, [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Download',
+            onPress: () => {
+              void applyUpdate(result.manifestItem);
             },
-          ]
-        );
+          },
+        ]);
       } else if (result.status === 'up_to_date') {
         setMessage('Catalog is already up to date.');
       } else if (result.status === 'throttled') {
@@ -92,11 +113,36 @@ export default function SettingsScreen() {
       } else {
         setMessage('No updates available right now.');
       }
-      await refreshMeta();
+      await refreshAll();
     } finally {
       setChecking(false);
     }
-  }, [applyUpdate, refreshMeta]);
+  }, [applyUpdate, refreshAll]);
+
+  const switchEngine = useCallback(
+    async (engine) => {
+      setChecking(true);
+      try {
+        await setScannerEngine(engine);
+        await refreshAll();
+      } finally {
+        setChecking(false);
+      }
+    },
+    [refreshAll]
+  );
+
+  const toggleMultilingualFallback = useCallback(async () => {
+    setChecking(true);
+    try {
+      await setMultilingualFallback(!scanSettings.multilingualFallback);
+      await refreshAll();
+    } finally {
+      setChecking(false);
+    }
+  }, [scanSettings.multilingualFallback, refreshAll]);
+
+  const isHybrid = scanSettings.engine === SCANNER_ENGINES.HYBRID_HASH_BETA;
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0d10' }} edges={['top', 'left', 'right']}>
@@ -124,8 +170,98 @@ export default function SettingsScreen() {
               <Text style={{ color: '#9aa4b2' }}>Source: {meta?.source ?? 'bundled asset'}</Text>
               <Text style={{ color: '#9aa4b2' }}>Updated: {formatDate(meta?.updatedAt)}</Text>
               <Text style={{ color: '#9aa4b2' }}>Last check: {formatDate(meta?.lastCheckAt)}</Text>
+              <Text style={{ color: '#9aa4b2' }}>Fingerprints: {fingerprintStats.total}</Text>
+              <Text style={{ color: '#9aa4b2' }}>Fingerprint cards: {fingerprintStats.uniqueCards}</Text>
             </>
           )}
+        </View>
+
+        <View
+          style={{
+            borderRadius: 12,
+            borderWidth: 1,
+            borderColor: 'rgba(255,255,255,0.2)',
+            backgroundColor: 'rgba(255,255,255,0.03)',
+            padding: 12,
+            gap: 10,
+          }}
+        >
+          <Text style={{ color: '#ffffff', fontWeight: '700' }}>Scanner Engine</Text>
+          <View style={{ flexDirection: 'row', gap: 8 }}>
+            <Pressable
+              onPress={() => switchEngine(SCANNER_ENGINES.LEGACY_OCR)}
+              disabled={checking}
+              style={{
+                flex: 1,
+                minHeight: 42,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor:
+                  scanSettings.engine === SCANNER_ENGINES.LEGACY_OCR
+                    ? 'rgba(130,205,255,0.9)'
+                    : 'rgba(255,255,255,0.28)',
+                alignItems: 'center',
+                justifyContent: 'center',
+                opacity: checking ? 0.6 : 1,
+              }}
+            >
+              <Text style={{ color: '#ffffff' }}>Legacy OCR</Text>
+            </Pressable>
+            <Pressable
+              onPress={() => switchEngine(SCANNER_ENGINES.HYBRID_HASH_BETA)}
+              disabled={checking}
+              style={{
+                flex: 1,
+                minHeight: 42,
+                borderRadius: 10,
+                borderWidth: 1,
+                borderColor:
+                  scanSettings.engine === SCANNER_ENGINES.HYBRID_HASH_BETA
+                    ? 'rgba(130,205,255,0.9)'
+                    : 'rgba(255,255,255,0.28)',
+                alignItems: 'center',
+                justifyContent: 'center',
+                opacity: checking ? 0.6 : 1,
+              }}
+            >
+              <Text style={{ color: '#ffffff' }}>Hybrid Hash (Beta)</Text>
+            </Pressable>
+          </View>
+          <Pressable
+            onPress={toggleMultilingualFallback}
+            disabled={checking || !isHybrid}
+            style={{
+              minHeight: 42,
+              borderRadius: 10,
+              borderWidth: 1,
+              borderColor: 'rgba(255,255,255,0.3)',
+              alignItems: 'center',
+              justifyContent: 'center',
+              opacity: checking || !isHybrid ? 0.55 : 1,
+            }}
+          >
+            <Text style={{ color: '#ffffff' }}>
+              OCR multilingual fallback: {scanSettings.multilingualFallback ? 'ON' : 'OFF'}
+            </Text>
+          </Pressable>
+        </View>
+
+        <View
+          style={{
+            borderRadius: 12,
+            borderWidth: 1,
+            borderColor: 'rgba(255,255,255,0.2)',
+            backgroundColor: 'rgba(255,255,255,0.03)',
+            padding: 12,
+            gap: 6,
+          }}
+        >
+          <Text style={{ color: '#ffffff', fontWeight: '700' }}>Scanner metrics (7d)</Text>
+          <Text style={{ color: '#9aa4b2' }}>Samples: {metrics?.total ?? 0}</Text>
+          <Text style={{ color: '#9aa4b2' }}>Direct match rate: {percent(metrics?.directMatchRate)}</Text>
+          <Text style={{ color: '#9aa4b2' }}>Ambiguous rate: {percent(metrics?.ambiguousRate)}</Text>
+          <Text style={{ color: '#9aa4b2' }}>False positive rate: {percent(metrics?.falsePositiveRate)}</Text>
+          <Text style={{ color: '#9aa4b2' }}>Avg time to match: {metrics?.avgLatencyMs ?? 'N/A'} ms</Text>
         </View>
 
         <Pressable
@@ -149,4 +285,3 @@ export default function SettingsScreen() {
     </SafeAreaView>
   );
 }
-
