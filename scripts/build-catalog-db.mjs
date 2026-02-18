@@ -435,9 +435,17 @@ async function buildCatalog() {
       cardsTsvPath,
       aliasesTsvPath
     );
-    const jpeg = withFingerprints ? await loadJpegModule(true) : null;
+    let fingerprintsEnabled = withFingerprints;
+    let jpeg = null;
+    if (withFingerprints) {
+      jpeg = await loadJpegModule(false);
+      if (!jpeg) {
+        fingerprintsEnabled = false;
+        console.warn('jpeg-js non installato: fingerprint disabilitati per questa build catalogo.');
+      }
+    }
     const fingerprintCount = await writeFingerprintTsv(englishRows, fingerprintsTsvPath, {
-      withFingerprints,
+      withFingerprints: fingerprintsEnabled,
       fingerprintLimit,
       jpeg,
     });
