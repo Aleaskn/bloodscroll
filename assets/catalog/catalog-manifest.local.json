@@ -1,8 +1,9 @@
 {
-  "version": "bootstrap-empty",
-  "generatedAt": "1970-01-01T00:00:00.000Z",
-  "cards": 0,
-  "md5": "",
-  "source": "bundled bootstrap",
+  "version": "2026-02-17",
+  "generatedAt": "2026-02-17T18:12:06.434Z",
+  "cards": 109636,
+  "aliases": 111908,
+  "md5": "beb17937d5833db8793788be45cd14fb",
+  "source": "https://data.scryfall.io/default-cards/default-cards-20260217101500.json",
   "dbUrl": "REPLACE_ME_WITH_RELEASE_ASSET_URL"
 }
