@@ -41,6 +41,7 @@ function parseArgs(argv) {
     manifest: DEFAULT_OUTPUT_MANIFEST,
     withFingerprints: true,
     fingerprintLimit: 0,
+    progressEvery: 500,
   };
 
   for (let i = 2; i < argv.length; i += 1) {
@@ -58,6 +59,9 @@ function parseArgs(argv) {
       args.withFingerprints = false;
     } else if (token === '--fingerprint-limit') {
       args.fingerprintLimit = Math.max(0, Number(argv[i + 1] ?? 0) || 0);
+      i += 1;
+    } else if (token === '--progress-every') {
+      args.progressEvery = Math.max(1, Number(argv[i + 1] ?? 500) || 500);
       i += 1;
     } else if (token === '--help' || token === '-h') {
       printHelpAndExit(0);
@@ -78,6 +82,7 @@ Options:
   --manifest  Local manifest output path (default: assets/catalog/catalog-manifest.local.json).
   --no-fingerprints     Skip image fingerprint generation.
   --fingerprint-limit N Generate fingerprints for first N cards (0 = all).
+  --progress-every N    Print progress every N fingerprint rows (default: 500).
 `);
   process.exit(code);
 }
@@ -318,7 +323,7 @@ async function fetchBinary(url) {
 async function writeFingerprintTsv(
   englishRows,
   fingerprintTsvPath,
-  { withFingerprints = true, fingerprintLimit = 0, jpeg = null } = {}
+  { withFingerprints = true, fingerprintLimit = 0, jpeg = null, progressEvery = 500 } = {}
 ) {
   const stream = createWriteStream(fingerprintTsvPath, { encoding: 'utf8' });
   if (!withFingerprints) {
@@ -330,6 +335,7 @@ async function writeFingerprintTsv(
   const cache = new Map();
   let count = 0;
   const maxRows = fingerprintLimit > 0 ? Math.min(fingerprintLimit, englishRows.length) : englishRows.length;
+  const startedAt = Date.now();
 
   for (let i = 0; i < maxRows; i += 1) {
     const row = englishRows[i];
@@ -368,6 +374,11 @@ async function writeFingerprintTsv(
       await once(stream, 'drain');
     }
     count += 1;
+    if (count % Math.max(1, progressEvery) === 0) {
+      const elapsedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+      const rate = Math.round(count / elapsedSec);
+      console.log(`[fingerprints] ${count}/${maxRows} rows (${rate}/s)`);
+    }
   }
 
   stream.end();
@@ -401,7 +412,7 @@ async function fetchDefaultCardsJsonPath(tempDir) {
 }
 
 async function buildCatalog() {
-  const { input, output, manifest, withFingerprints, fingerprintLimit } = parseArgs(process.argv);
+  const { input, output, manifest, withFingerprints, fingerprintLimit, progressEvery } = parseArgs(process.argv);
   const tempDir = await mkdtemp(resolve(tmpdir(), 'bloodscroll-catalog-'));
   const cardsTsvPath = resolve(tempDir, 'catalog_cards.tsv');
   const aliasesTsvPath = resolve(tempDir, 'catalog_name_alias.tsv');
@@ -448,6 +459,7 @@ async function buildCatalog() {
       withFingerprints: fingerprintsEnabled,
       fingerprintLimit,
       jpeg,
+      progressEvery,
     });
 
     runSqlite(
