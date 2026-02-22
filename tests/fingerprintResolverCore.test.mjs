@@ -94,5 +94,7 @@ test('resolveByFingerprintWithRepository returns none when fingerprint payload i
     dhash_lo: 0,
     bucket16: 0,
   });
-  assert.deepEqual(result, { status: 'none', reason: 'fingerprint_unavailable' });
+  assert.equal(result.status, 'none');
+  assert.equal(result.reason, 'fingerprint_unavailable');
+  assert.equal(typeof result.debug, 'object');
 });

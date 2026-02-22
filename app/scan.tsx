@@ -47,6 +47,22 @@ function toFileUri(pathOrUri) {
   return `file://${pathOrUri}`;
 }
 
+async function ensureExistingFileUri(pathOrUri) {
+  const uri = toFileUri(pathOrUri);
+  if (!uri) return '';
+  try {
+    const info = await FileSystem.getInfoAsync(uri);
+    return info?.exists ? uri : '';
+  } catch {
+    return '';
+  }
+}
+
+function isVisionCameraPermissionGranted(status: string) {
+  const normalized = String(status || '').toLowerCase();
+  return normalized === 'granted' || normalized === 'authorized';
+}
+
 export default function ScanScreen() {
   const router = useRouter();
   const isFocused = useIsFocused();
@@ -64,6 +80,16 @@ export default function ScanScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [hintText, setHintText] = useState('Loading scanner...');
+  const [debugOverlay, setDebugOverlay] = useState({
+    phashHi: '-',
+    phashLo: '-',
+    dhashHi: '-',
+    dhashLo: '-',
+    bucket16: '-',
+    rawHits: '-',
+    minHamming: '-',
+    minHamSwap: '-',
+  });
   const [candidates, setCandidates] = useState<any[]>([]);
   const CameraView = cameraModule?.CameraView;
   const VisionCamera = visionCameraModule?.Camera;
@@ -87,11 +113,10 @@ export default function ScanScreen() {
       cameraAvailable &&
       cameraReady &&
       permission === 'granted' &&
-      catalogReady &&
       !hasCandidates &&
       !busy
     );
-  }, [isFocused, usingHybrid, VisionCamera, visionDevice, CameraView, cameraReady, permission, catalogReady, hasCandidates, busy]);
+  }, [isFocused, usingHybrid, VisionCamera, visionDevice, CameraView, cameraReady, permission, hasCandidates, busy]);
 
   const clearScanningTimer = useCallback(() => {
     if (!scanningTimeoutRef.current) return;
@@ -113,18 +138,29 @@ export default function ScanScreen() {
 
     const setupCore = async () => {
       try {
-        const [ocrReady] = await Promise.all([isOnDeviceOcrAvailable(), ensureCatalogReady(), refreshScanSettings()]);
-        if (!ocrReady) {
+        setHintText('Loading scanner...');
+        await refreshScanSettings();
+
+        // OCR availability is optional in Hybrid mode during bootstrap.
+        const ocrReady = await isOnDeviceOcrAvailable();
+        if (!ocrReady && !usingHybrid) {
           throw new Error('OCR on-device non disponibile. Verifica la build di sviluppo.');
         }
+
+        await ensureCatalogReady();
         if (!mounted) return;
         setCatalogReady(true);
         setHintText('Point your camera at a card');
       } catch (setupError) {
         if (!mounted) return;
         setCatalogReady(false);
-        setHintText('Scanner unavailable');
-        setError(setupError instanceof Error ? setupError.message : 'Errore inizializzazione scanner.');
+        // Keep scan loop alive for diagnostics even if bootstrap partially fails.
+        setHintText('Scanner init partial. Running diagnostics...');
+        setError(
+          setupError instanceof Error
+            ? setupError.message
+            : 'Errore inizializzazione scanner.'
+        );
       }
     };
 
@@ -132,7 +168,7 @@ export default function ScanScreen() {
     return () => {
       mounted = false;
     };
-  }, [refreshScanSettings]);
+  }, [refreshScanSettings, usingHybrid]);
 
   useEffect(() => {
     let mounted = true;
@@ -167,11 +203,11 @@ export default function ScanScreen() {
         if (!mounted) return;
         setVisionCameraModule(mod);
         const status = await mod.Camera.getCameraPermissionStatus();
-        if (status === 'authorized') {
+        if (isVisionCameraPermissionGranted(status)) {
           setPermission('granted');
         } else {
           const requested = await mod.Camera.requestCameraPermission();
-          setPermission(requested === 'authorized' ? 'granted' : 'denied');
+          setPermission(isVisionCameraPermissionGranted(requested) ? 'granted' : 'denied');
         }
         const devices = mod.Camera.getAvailableCameraDevices?.() ?? [];
         const back = devices.find((device: any) => device?.position === 'back') ?? null;
@@ -206,6 +242,16 @@ export default function ScanScreen() {
       stableMatchRef.current = { cardId: '', count: 0 };
       setCandidates([]);
       setError('');
+      setDebugOverlay({
+        phashHi: '-',
+        phashLo: '-',
+        dhashHi: '-',
+        dhashLo: '-',
+        bucket16: '-',
+        rawHits: '-',
+        minHamming: '-',
+        minHamSwap: '-',
+      });
       if (catalogReady) setHintText('Point your camera at a card');
       return () => {
         clearScanningTimer();
@@ -247,20 +293,32 @@ export default function ScanScreen() {
     const camera = hybridCameraRef.current;
     if (!camera) return '';
 
-    if (typeof camera.takeSnapshot === 'function') {
-      const snapshot = await camera.takeSnapshot({
-        quality: 85,
-        skipMetadata: true,
-      });
-      return toFileUri(snapshot?.path ?? snapshot);
+    // iOS is generally more stable with takePhoto in dev builds.
+    if (typeof camera.takePhoto === 'function') {
+      try {
+        const photo = await camera.takePhoto({
+          qualityPrioritization: 'speed',
+          enableShutterSound: false,
+          skipMetadata: true,
+        });
+        const fromPhoto = await ensureExistingFileUri(photo?.path ?? photo?.uri ?? photo);
+        if (fromPhoto) return fromPhoto;
+      } catch {
+        // fallback below
+      }
     }
 
-    if (typeof camera.takePhoto === 'function') {
-      const photo = await camera.takePhoto({
-        qualityPrioritization: 'speed',
-        enableShutterSound: false,
-      });
-      return toFileUri(photo?.path ?? photo?.uri);
+    if (typeof camera.takeSnapshot === 'function') {
+      try {
+        const snapshot = await camera.takeSnapshot({
+          quality: 85,
+          skipMetadata: true,
+        });
+        const fromSnapshot = await ensureExistingFileUri(snapshot?.path ?? snapshot?.uri ?? snapshot);
+        if (fromSnapshot) return fromSnapshot;
+      } catch {
+        // no-op
+      }
     }
 
     return '';
@@ -278,7 +336,7 @@ export default function ScanScreen() {
       capturedUri = usingHybrid ? await captureHybridUri() : await captureLegacyUri();
       if (!capturedUri) return;
 
-      const shouldAllowOcrFallback = !usingHybrid || missStreakRef.current >= 6;
+      const shouldAllowOcrFallback = !usingHybrid || missStreakRef.current >= 1;
 
       const result = await processFrameAndResolveCard({
         imageUri: capturedUri,
@@ -287,7 +345,27 @@ export default function ScanScreen() {
         artworkFrameInCard: ARTWORK_FRAME,
         enableMultilingualFallback: scanSettings.multilingualFallback,
         allowOcrFallback: shouldAllowOcrFallback,
+        skipEditionOcrInPrimary: usingHybrid,
       });
+      const cycleDebug = result?.debug || result?.evidence?.debug || null;
+      if (cycleDebug) {
+        setDebugOverlay({
+          phashHi: String(cycleDebug.phash_hi ?? '-'),
+          phashLo: String(cycleDebug.phash_lo ?? '-'),
+          dhashHi: String(cycleDebug.dhash_hi ?? '-'),
+          dhashLo: String(cycleDebug.dhash_lo ?? '-'),
+          bucket16: String(cycleDebug.bucket16 ?? '-'),
+          rawHits: String(cycleDebug.rawHitsCount ?? '-'),
+          minHamming: String(cycleDebug.minHammingDistance ?? '-'),
+          minHamSwap: String(cycleDebug.minHammingDistanceSwapHiLo ?? '-'),
+        });
+      } else {
+        setDebugOverlay((prev) => ({
+          ...prev,
+          rawHits: '-',
+          minHamming: '-',
+        }));
+      }
 
       if (result.status === 'matched' && result.cardId) {
         const confidence = Number(result.confidence ?? 0);
@@ -524,6 +602,41 @@ export default function ScanScreen() {
                       : 'OCR title first, edition only for ambiguous matches'}
                   </Text>
                 </View>
+
+                {usingHybrid ? (
+                  <View
+                    style={{
+                      position: 'absolute',
+                      left: 8,
+                      right: 8,
+                      top: 8,
+                      borderRadius: 8,
+                      paddingHorizontal: 8,
+                      paddingVertical: 6,
+                      backgroundColor: 'rgba(10,12,16,0.72)',
+                      borderWidth: 1,
+                      borderColor: 'rgba(255,255,255,0.18)',
+                      gap: 2,
+                    }}
+                  >
+                    <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                      p_hi: {debugOverlay.phashHi} | p_lo: {debugOverlay.phashLo}
+                    </Text>
+                    <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                      d_hi: {debugOverlay.dhashHi} | d_lo: {debugOverlay.dhashLo}
+                    </Text>
+                    <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                      bucket16: {debugOverlay.bucket16} | hits(raw): {debugOverlay.rawHits} | minHam:{' '}
+                      {debugOverlay.minHamming}
+                    </Text>
+                    <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                      minHamSwap(hi/lo): {debugOverlay.minHamSwap}
+                    </Text>
+                    <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
+                      perm:{permission} cam:{cameraReady ? '1' : '0'} cat:{catalogReady ? '1' : '0'}
+                    </Text>
+                  </View>
+                ) : null}
               </View>
             </View>
             {error ? <Text style={{ color: '#ff8a8a', textAlign: 'center' }}>{error}</Text> : null}

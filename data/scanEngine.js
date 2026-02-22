@@ -4,7 +4,7 @@ import {
   extractCardTitleTextOnDevice,
   extractEditionTextOnDevice,
 } from './ocrOnDevice';
-import { createImageFingerprint } from './imageFingerprint';
+import { createImageFingerprintCandidates } from './imageFingerprint';
 import { resolveByFingerprint } from './fingerprintResolver';
 
 function normalizeCollectorNumber(value) {
@@ -34,13 +34,6 @@ function extractFooterHint(editionText) {
     setCode: candidates[0].setCode || '',
     collectorNumber: candidates[0].collectorNumber || '',
   };
-}
-
-function normalizeScanResult(result, fallbackReason = 'none') {
-  if (!result || typeof result !== 'object') return { status: 'none', reason: fallbackReason };
-  if (result.status === 'matched') return result;
-  if (result.status === 'ambiguous') return result;
-  return { status: 'none', reason: fallbackReason };
 }
 
 function disambiguateCandidatesByEdition(candidates, footerHint, editionText) {
@@ -87,187 +80,278 @@ function mergeAmbiguousCandidates(primary = [], secondary = []) {
   return merged;
 }
 
+function reconcileWithFingerprintAmbiguous(result, fingerprintAmbiguous, titleText, editionText, sourceLabel) {
+  if (!result || result.status === 'none') return null;
+  if (result.status === 'matched') {
+    if (!fingerprintAmbiguous) {
+      return {
+        ...result,
+        evidence: {
+          source: sourceLabel,
+          titleText,
+          editionText,
+        },
+        debug: fingerprintAmbiguous?.debug || null,
+      };
+    }
+
+    const fingerprintHasOcrCard = fingerprintAmbiguous.candidates?.some(
+      (entry) => String(entry.id) === String(result.cardId)
+    );
+
+    if (fingerprintHasOcrCard) {
+      return {
+        ...result,
+        matchedBy: 'fingerprint_ocr_consensus',
+        confidence: Math.max(Number(result.confidence ?? 0.8), Number(fingerprintAmbiguous.confidence ?? 0.8)),
+        evidence: {
+          source: 'fingerprint_ocr_consensus',
+          titleText,
+          editionText,
+        },
+        debug: fingerprintAmbiguous?.debug || null,
+      };
+    }
+
+    return {
+      ...fingerprintAmbiguous,
+      matchedBy: 'fingerprint_ocr_conflict',
+      debug: fingerprintAmbiguous?.debug || null,
+    };
+  }
+
+  if (result.status === 'ambiguous') {
+    if (!fingerprintAmbiguous) {
+      return {
+        ...result,
+        evidence: {
+          source: sourceLabel,
+          titleText,
+          editionText,
+        },
+        debug: fingerprintAmbiguous?.debug || null,
+      };
+    }
+
+    return {
+      status: 'ambiguous',
+      matchedBy: 'fingerprint_ocr_ambiguous',
+      confidence: Math.max(Number(fingerprintAmbiguous.confidence ?? 0.6), Number(result.confidence ?? 0.6)),
+      candidates: mergeAmbiguousCandidates(fingerprintAmbiguous.candidates || [], result.candidates || []).slice(0, 12),
+      evidence: {
+        source: 'fingerprint_ocr_ambiguous',
+        titleText,
+        editionText,
+      },
+      debug: fingerprintAmbiguous?.debug || null,
+    };
+  }
+
+  return null;
+}
+
 export async function processFrameAndResolveCard(frameMeta = {}) {
   const imageUri = frameMeta.imageUri || '';
   const cardFrame = frameMeta.cardFrame || {};
   const editionFrameInCard = frameMeta.editionFrameInCard || {};
   const enableMultilingualFallback = !!frameMeta.enableMultilingualFallback;
   const allowOcrFallback = !!frameMeta.allowOcrFallback;
+  const skipEditionOcrInPrimary = !!frameMeta.skipEditionOcrInPrimary;
 
   if (!imageUri) return { status: 'none', reason: 'missing_image_uri' };
 
-  const editionText = await extractEditionTextOnDevice(imageUri, {
-    cardFrame,
-    editionFrameInCard,
-  });
+  // 1) Optional edition-first path (disabled for hash-only debug mode).
+  const editionText = skipEditionOcrInPrimary
+    ? ''
+    : await extractEditionTextOnDevice(imageUri, {
+        cardFrame,
+        editionFrameInCard,
+      });
   const footerHint = extractFooterHint(editionText);
-  let fingerprintAmbiguous = null;
 
-  const fingerprint = await createImageFingerprint(imageUri, {
-    cardFrame,
-    artworkFrameInCard: frameMeta.artworkFrameInCard,
-  });
-
-  if (fingerprint) {
-    const fingerprintResult = await resolveByFingerprint({
-      ...fingerprint,
-      setCode: footerHint.setCode,
-      collectorNumber: footerHint.collectorNumber,
-      editionText,
-    });
-
-    if (fingerprintResult.status === 'matched') {
-      return normalizeScanResult(
-        {
-          ...fingerprintResult,
-          evidence: {
-            ...(fingerprintResult.evidence || {}),
-            editionText,
-            source: 'fingerprint',
-          },
+  if (!skipEditionOcrInPrimary && footerHint.setCode && footerHint.collectorNumber) {
+    const editionOnlyResult = await resolveLocalScannedCard({ cardText: '', editionText });
+    if (editionOnlyResult.status === 'matched') {
+      return {
+        ...editionOnlyResult,
+        confidence: Math.max(Number(editionOnlyResult.confidence ?? 0.9), 0.95),
+        matchedBy: 'set_collector_exact',
+        evidence: {
+          source: 'edition_fast_path',
+          editionText,
         },
-        'fingerprint_no_match'
-      );
-    }
-
-    if (fingerprintResult.status === 'ambiguous' && Array.isArray(fingerprintResult.candidates)) {
-      if (!fingerprintResult.candidates.length) {
-        return { status: 'none', reason: 'fingerprint_ambiguous_empty' };
-      }
-      const editionResolved = disambiguateCandidatesByEdition(
-        fingerprintResult.candidates,
-        footerHint,
-        editionText
-      );
-      if (editionResolved) {
-        return {
-          status: 'matched',
-          cardId: String(editionResolved.id),
-          matchedBy: 'fingerprint_ambiguous_resolved_by_edition',
-          confidence: Math.max(0.9, Number(fingerprintResult.confidence ?? 0.85)),
-          card: editionResolved,
-          evidence: {
-            ...(fingerprintResult.evidence || {}),
-            source: 'fingerprint',
-            editionText,
-          },
-        };
-      }
-
-      fingerprintAmbiguous = normalizeScanResult(
-        {
-          ...fingerprintResult,
-          evidence: {
-            ...(fingerprintResult.evidence || {}),
-            editionText,
-            source: 'fingerprint',
-          },
-        },
-        'fingerprint_ambiguous'
-      );
+      };
     }
   }
 
-  if (fingerprintAmbiguous?.status === 'ambiguous' && !allowOcrFallback) {
-    return fingerprintAmbiguous;
+  // 2) Fingerprint-first resolution.
+  let fingerprintAmbiguous = null;
+  let bestFingerprintNoneDebug = null;
+  const fingerprintCandidates = await createImageFingerprintCandidates(imageUri, {
+    cardFrame,
+    artworkFrameInCard: frameMeta.artworkFrameInCard,
+    maxVariants: 5,
+  });
+
+  if (Array.isArray(fingerprintCandidates) && fingerprintCandidates.length) {
+    let bestMatched = null;
+    for (const fingerprint of fingerprintCandidates) {
+      const fingerprintResult = await resolveByFingerprint({
+        ...fingerprint,
+        setCode: footerHint.setCode,
+        collectorNumber: footerHint.collectorNumber,
+        editionText,
+      });
+
+      if (fingerprintResult.status === 'matched') {
+        const withDebug = {
+          ...fingerprintResult,
+          evidence: {
+            ...(fingerprintResult.evidence || {}),
+            source: 'fingerprint',
+            editionText,
+            variant: fingerprint.variant ?? null,
+          },
+          debug: {
+            ...(fingerprintResult.debug || {}),
+            variant: fingerprint.variant ?? null,
+          },
+        };
+        if (!bestMatched || Number(withDebug.confidence ?? 0) > Number(bestMatched.confidence ?? 0)) {
+          bestMatched = withDebug;
+        }
+        continue;
+      }
+
+      if (fingerprintResult.status === 'ambiguous' && Array.isArray(fingerprintResult.candidates)) {
+        if (!fingerprintResult.candidates.length) {
+          continue;
+        }
+
+        const editionResolved = disambiguateCandidatesByEdition(
+          fingerprintResult.candidates,
+          footerHint,
+          editionText
+        );
+        if (editionResolved) {
+          return {
+            status: 'matched',
+            cardId: String(editionResolved.id),
+            matchedBy: 'fingerprint_ambiguous_resolved_by_edition',
+            confidence: Math.max(0.9, Number(fingerprintResult.confidence ?? 0.85)),
+            card: editionResolved,
+            evidence: {
+              ...(fingerprintResult.evidence || {}),
+              source: 'fingerprint',
+              editionText,
+              variant: fingerprint.variant ?? null,
+            },
+            debug: {
+              ...(fingerprintResult.debug || {}),
+              variant: fingerprint.variant ?? null,
+            },
+          };
+        }
+
+        const candidateAmbiguous = {
+          ...fingerprintResult,
+          evidence: {
+            ...(fingerprintResult.evidence || {}),
+            source: 'fingerprint',
+            editionText,
+            variant: fingerprint.variant ?? null,
+          },
+          debug: {
+            ...(fingerprintResult.debug || {}),
+            variant: fingerprint.variant ?? null,
+          },
+        };
+
+        if (!fingerprintAmbiguous) {
+          fingerprintAmbiguous = candidateAmbiguous;
+        } else {
+          const prev = Number(fingerprintAmbiguous?.debug?.minHammingDistance ?? Number.POSITIVE_INFINITY);
+          const next = Number(candidateAmbiguous?.debug?.minHammingDistance ?? Number.POSITIVE_INFINITY);
+          if (next < prev) {
+            fingerprintAmbiguous = candidateAmbiguous;
+          }
+        }
+      }
+
+      if (fingerprintResult.status === 'none') {
+        const candidateNoneDebug = {
+          ...(fingerprintResult.debug || {}),
+          variant: fingerprint.variant ?? null,
+        };
+        if (!bestFingerprintNoneDebug) {
+          bestFingerprintNoneDebug = candidateNoneDebug;
+        } else {
+          const prev = Number(bestFingerprintNoneDebug.minHammingDistance ?? Number.POSITIVE_INFINITY);
+          const next = Number(candidateNoneDebug.minHammingDistance ?? Number.POSITIVE_INFINITY);
+          if (next < prev) {
+            bestFingerprintNoneDebug = candidateNoneDebug;
+          }
+        }
+      }
+    }
+
+    if (bestMatched) return bestMatched;
+    if (fingerprintAmbiguous && !allowOcrFallback) return fingerprintAmbiguous;
   }
 
   if (!allowOcrFallback) {
     return {
       status: 'none',
       reason: 'fingerprint_no_confident_match',
+      debug: fingerprintAmbiguous?.debug || bestFingerprintNoneDebug || null,
     };
   }
 
-  const [titleText, cardText] = await Promise.all([
-    extractCardTitleTextOnDevice(imageUri, {
-      cardFrame,
-      enableMultilingualFallback,
-    }),
-    extractCardTextOnDevice(imageUri, {
-      cardFrame,
-    }),
-  ]);
-
-  const mergedCardText = [titleText, cardText].filter(Boolean).join('\n');
-  if (!mergedCardText && !editionText) return { status: 'none', reason: 'ocr_empty' };
-
-  const ocrResult = await resolveLocalScannedCard({
-    cardText: mergedCardText,
-    editionText,
+  // 3) OCR fallback - title only first.
+  const titleText = await extractCardTitleTextOnDevice(imageUri, {
+    cardFrame,
+    enableMultilingualFallback,
   });
 
-  if (ocrResult.status === 'matched') {
-    if (fingerprintAmbiguous?.status === 'ambiguous') {
-      const fingerprintHasOcrCard = fingerprintAmbiguous.candidates?.some(
-        (entry) => String(entry.id) === String(ocrResult.cardId)
-      );
-      if (fingerprintHasOcrCard) {
-        return {
-          ...ocrResult,
-          matchedBy: 'fingerprint_ocr_consensus',
-          confidence: Math.max(Number(ocrResult.confidence ?? 0.8), Number(fingerprintAmbiguous.confidence ?? 0.8)),
-          evidence: {
-            source: 'fingerprint_ocr_consensus',
-            titleText,
-            editionText,
-          },
-        };
-      }
-      return {
-        ...fingerprintAmbiguous,
-        matchedBy: 'fingerprint_ocr_conflict',
-      };
-    }
-
-    return {
-      ...ocrResult,
-      evidence: {
-        source: 'ocr_fallback',
-        titleText,
-        editionText,
-      },
-    };
+  if (titleText || editionText) {
+    const titleResult = await resolveLocalScannedCard({
+      cardText: titleText || '',
+      editionText,
+    });
+    const reconciledTitle = reconcileWithFingerprintAmbiguous(
+      titleResult,
+      fingerprintAmbiguous,
+      titleText,
+      editionText,
+      'ocr_title_fallback'
+    );
+    if (reconciledTitle) return reconciledTitle;
   }
 
-  if (ocrResult.status === 'ambiguous') {
-    if (fingerprintAmbiguous?.status === 'ambiguous') {
-      const mergedCandidates = mergeAmbiguousCandidates(
-        fingerprintAmbiguous.candidates || [],
-        ocrResult.candidates || []
-      );
-      return {
-        status: 'ambiguous',
-        matchedBy: 'fingerprint_ocr_ambiguous',
-        confidence: Math.max(
-          Number(fingerprintAmbiguous.confidence ?? 0.6),
-          Number(ocrResult.confidence ?? 0.6)
-        ),
-        candidates: mergedCandidates.slice(0, 12),
-        evidence: {
-          source: 'fingerprint_ocr_ambiguous',
-          titleText,
-          editionText,
-        },
-      };
-    }
-
-    return {
-      ...ocrResult,
-      evidence: {
-        source: 'ocr_fallback',
-        titleText,
-        editionText,
-      },
-    };
+  // 4) OCR fallback - full card text as last chance only.
+  const cardText = await extractCardTextOnDevice(imageUri, {
+    cardFrame,
+  });
+  if (cardText || titleText || editionText) {
+    const fullResult = await resolveLocalScannedCard({
+      cardText: [titleText, cardText].filter(Boolean).join('\n'),
+      editionText,
+    });
+    const reconciledFull = reconcileWithFingerprintAmbiguous(
+      fullResult,
+      fingerprintAmbiguous,
+      titleText,
+      editionText,
+      'ocr_full_fallback'
+    );
+    if (reconciledFull) return reconciledFull;
   }
 
-  if (fingerprintAmbiguous?.status === 'ambiguous') {
-    return fingerprintAmbiguous;
-  }
+  if (fingerprintAmbiguous) return fingerprintAmbiguous;
 
   return {
     status: 'none',
-    reason: 'no_confident_match_ocr_fallback',
+    reason: 'no_confident_match',
+    debug: bestFingerprintNoneDebug || null,
   };
 }

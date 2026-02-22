@@ -23,6 +23,53 @@ export function rgbaToGrayscale(rgba, width, height) {
   return gray;
 }
 
+export function normalizeGrayscaleContrast(
+  gray,
+  { lowPercentile = 0.03, highPercentile = 0.97, gamma = 1 } = {}
+) {
+  if (!gray || !gray.length) return new Uint8Array(0);
+  const histogram = new Uint32Array(256);
+  for (let i = 0; i < gray.length; i += 1) {
+    histogram[gray[i]] += 1;
+  }
+
+  const total = gray.length;
+  const lowTarget = Math.floor(total * Math.max(0, Math.min(1, Number(lowPercentile) || 0)));
+  const highTarget = Math.floor(total * Math.max(0, Math.min(1, Number(highPercentile) || 1)));
+
+  let cumulative = 0;
+  let low = 0;
+  for (let i = 0; i < 256; i += 1) {
+    cumulative += histogram[i];
+    if (cumulative >= lowTarget) {
+      low = i;
+      break;
+    }
+  }
+
+  cumulative = 0;
+  let high = 255;
+  for (let i = 0; i < 256; i += 1) {
+    cumulative += histogram[i];
+    if (cumulative >= highTarget) {
+      high = i;
+      break;
+    }
+  }
+
+  if (high <= low) return new Uint8Array(gray);
+
+  const gammaSafe = Number.isFinite(Number(gamma)) && Number(gamma) > 0 ? Number(gamma) : 1;
+  const invRange = 1 / (high - low);
+  const output = new Uint8Array(gray.length);
+  for (let i = 0; i < gray.length; i += 1) {
+    const n = Math.max(0, Math.min(1, (gray[i] - low) * invRange));
+    const v = gammaSafe === 1 ? n : Math.pow(n, gammaSafe);
+    output[i] = clampByte(v * 255);
+  }
+  return output;
+}
+
 function computeDct2D(values, size) {
   const result = Array.from({ length: size }, () => new Float64Array(size));
   const coeff = Math.PI / (2 * size);
@@ -90,6 +137,22 @@ export function hiLoToHex64(hi, lo) {
   return `${hiHex}${loHex}`;
 }
 
+export function hiLoToBigInt(hi, lo) {
+  const hiUnsigned = BigInt((Number(hi) >>> 0) & 0xffffffff);
+  const loUnsigned = BigInt((Number(lo) >>> 0) & 0xffffffff);
+  return (hiUnsigned << 32n) | loUnsigned;
+}
+
+function popcountBigInt(value) {
+  let v = value < 0n ? -value : value;
+  let count = 0;
+  while (v > 0n) {
+    count += Number(v & 1n);
+    v >>= 1n;
+  }
+  return count;
+}
+
 function popcount32(n) {
   let value = n >>> 0;
   let count = 0;
@@ -102,6 +165,12 @@ function popcount32(n) {
 
 export function hammingDistance64(aHi, aLo, bHi, bLo) {
   return popcount32((aHi ^ bHi) >>> 0) + popcount32((aLo ^ bLo) >>> 0);
+}
+
+export function hammingDistance64BigInt(aHi, aLo, bHi, bLo) {
+  const a = hiLoToBigInt(aHi, aLo);
+  const b = hiLoToBigInt(bHi, bLo);
+  return popcountBigInt(a ^ b);
 }
 
 export function deriveBucket16FromHi(hi) {

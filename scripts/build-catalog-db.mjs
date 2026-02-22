@@ -12,6 +12,7 @@ import {
   computeDHash64FromGrayscale,
   computePHash64FromGrayscale,
   deriveBucket16FromHi,
+  normalizeGrayscaleContrast,
   rgbaToGrayscale,
   splitHex64ToHiLo,
 } from '../data/fingerprintCore.mjs';
@@ -142,16 +143,33 @@ function pickCardFields(card) {
   };
 }
 
-function getCardArtUrl(card) {
-  if (card?.image_uris?.art_crop) return String(card.image_uris.art_crop);
-  if (card?.image_uris?.normal) return String(card.image_uris.normal);
+function getCardArtSources(card) {
+  const sources = [];
+  if (card?.image_uris?.art_crop) {
+    sources.push({ url: String(card.image_uris.art_crop), source: 'art_crop' });
+  }
+  if (card?.image_uris?.normal) {
+    sources.push({ url: String(card.image_uris.normal), source: 'normal' });
+  }
   if (Array.isArray(card?.card_faces)) {
     for (const face of card.card_faces) {
-      if (face?.image_uris?.art_crop) return String(face.image_uris.art_crop);
-      if (face?.image_uris?.normal) return String(face.image_uris.normal);
+      if (face?.image_uris?.art_crop) {
+        sources.push({ url: String(face.image_uris.art_crop), source: 'art_crop' });
+      }
+      if (face?.image_uris?.normal) {
+        sources.push({ url: String(face.image_uris.normal), source: 'normal' });
+      }
     }
   }
-  return '';
+  const unique = [];
+  const seen = new Set();
+  for (const entry of sources) {
+    const key = `${entry.source}|${entry.url}`;
+    if (!entry.url || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(entry);
+  }
+  return unique;
 }
 
 async function writeCatalogTsvs(cards, cardsTsvPath, aliasesTsvPath) {
@@ -179,7 +197,6 @@ async function writeCatalogTsvs(cards, cardsTsvPath, aliasesTsvPath) {
     ].join('\t');
 
     if (!cardsStream.write(`${line}\n`)) {
-      // eslint-disable-next-line no-await-in-loop
       await once(cardsStream, 'drain');
     }
 
@@ -190,7 +207,7 @@ async function writeCatalogTsvs(cards, cardsTsvPath, aliasesTsvPath) {
       oracle_id: sanitizeTsv(card.oracle_id ?? ''),
       lang: sanitizeTsv(card.lang ?? 'en') || 'en',
       art_variant: sanitizeTsv(card.finishes?.join(',') || card.border_color || ''),
-      art_url: sanitizeTsv(getCardArtUrl(card)),
+      art_sources: getCardArtSources(card),
       aliases: [
         row.name_norm,
         normalizeCatalogName(card.printed_name ?? ''),
@@ -232,7 +249,6 @@ async function writeCatalogTsvs(cards, cardsTsvPath, aliasesTsvPath) {
 
   for (const row of englishRows) {
     for (const alias of row.aliases) {
-      // eslint-disable-next-line no-await-in-loop
       await writeAlias(alias, row.id);
     }
   }
@@ -263,7 +279,6 @@ async function writeCatalogTsvs(cards, cardsTsvPath, aliasesTsvPath) {
       normalizeCatalogName(card.flavor_name ?? ''),
     ];
     for (const alias of aliases) {
-      // eslint-disable-next-line no-await-in-loop
       await writeAlias(alias, targetId);
     }
   }
@@ -290,20 +305,59 @@ function resizeGrayscaleNearest(gray, srcWidth, srcHeight, dstWidth, dstHeight) 
   return out;
 }
 
-function computeFingerprintFromJpegBuffer(buffer, jpeg) {
-  const decoded = jpeg.decode(buffer, { useTArray: true });
-  if (!decoded?.width || !decoded?.height || !decoded?.data) return null;
-  const gray = rgbaToGrayscale(decoded.data, decoded.width, decoded.height);
-  if (!gray.length) return null;
+function clamp01(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
 
-  const pInput = resizeGrayscaleNearest(gray, decoded.width, decoded.height, 32, 32);
-  const dInput = resizeGrayscaleNearest(gray, decoded.width, decoded.height, 9, 8);
+function cropGrayscale(gray, width, height, frame) {
+  const left = clamp01(frame.leftInCard, 0);
+  const top = clamp01(frame.topInCard, 0);
+  const w = clamp01(frame.widthInCard, 1);
+  const h = clamp01(frame.heightInCard, 1);
+  const originX = Math.max(0, Math.round(width * left));
+  const originY = Math.max(0, Math.round(height * top));
+  const cropWidth = Math.max(1, Math.min(Math.round(width * w), width - originX));
+  const cropHeight = Math.max(1, Math.min(Math.round(height * h), height - originY));
+  const out = new Uint8Array(cropWidth * cropHeight);
+  for (let y = 0; y < cropHeight; y += 1) {
+    const srcStart = (originY + y) * width + originX;
+    const dstStart = y * cropWidth;
+    out.set(gray.subarray(srcStart, srcStart + cropWidth), dstStart);
+  }
+  return { gray: out, width: cropWidth, height: cropHeight };
+}
+
+function buildArtworkFramesForNormal() {
+  const base = { leftInCard: 0.08, topInCard: 0.18, widthInCard: 0.84, heightInCard: 0.46 };
+  const variants = [
+    { ...base, tag: 'normal_base' },
+    { ...base, leftInCard: 0.04, tag: 'normal_left' },
+    { ...base, leftInCard: 0.12, tag: 'normal_right' },
+    { ...base, topInCard: 0.14, tag: 'normal_up' },
+    { ...base, topInCard: 0.22, tag: 'normal_down' },
+  ];
+  return variants.map((entry) => ({
+    ...entry,
+    leftInCard: clamp01(entry.leftInCard, base.leftInCard),
+    topInCard: clamp01(entry.topInCard, base.topInCard),
+    widthInCard: clamp01(entry.widthInCard, base.widthInCard),
+    heightInCard: clamp01(entry.heightInCard, base.heightInCard),
+  }));
+}
+
+function computeFingerprintFromGrayscale(gray, width, height) {
+  const normalized = normalizeGrayscaleContrast(gray);
+  const pInput = resizeGrayscaleNearest(normalized, width, height, 32, 32);
+  const dInput = resizeGrayscaleNearest(normalized, width, height, 9, 8);
   const phash64 = computePHash64FromGrayscale(pInput, 32, 32);
   const dhash64 = computeDHash64FromGrayscale(dInput, 9, 8);
   const pSplit = splitHex64ToHiLo(phash64);
   const dSplit = splitHex64ToHiLo(dhash64);
   if (!pSplit || !dSplit) return null;
-
   return {
     phash_hi: pSplit.hi,
     phash_lo: pSplit.lo,
@@ -311,6 +365,31 @@ function computeFingerprintFromJpegBuffer(buffer, jpeg) {
     dhash_lo: dSplit.lo,
     bucket16: deriveBucket16FromHi(pSplit.hi),
   };
+}
+
+function computeFingerprintFromJpegBuffer(buffer, jpeg, sourceType = 'art_crop') {
+  const decoded = jpeg.decode(buffer, { useTArray: true });
+  if (!decoded?.width || !decoded?.height || !decoded?.data) return [];
+  const gray = rgbaToGrayscale(decoded.data, decoded.width, decoded.height);
+  if (!gray.length) return [];
+
+  if (sourceType === 'normal') {
+    const fingerprints = [];
+    for (const frame of buildArtworkFramesForNormal()) {
+      const cropped = cropGrayscale(gray, decoded.width, decoded.height, frame);
+      const fp = computeFingerprintFromGrayscale(cropped.gray, cropped.width, cropped.height);
+      if (fp) {
+        fingerprints.push({
+          ...fp,
+          sourceVariant: frame.tag,
+        });
+      }
+    }
+    return fingerprints;
+  }
+
+  const fp = computeFingerprintFromGrayscale(gray, decoded.width, decoded.height);
+  return fp ? [{ ...fp, sourceVariant: 'art_crop_base' }] : [];
 }
 
 async function fetchBinary(url) {
@@ -339,45 +418,50 @@ async function writeFingerprintTsv(
 
   for (let i = 0; i < maxRows; i += 1) {
     const row = englishRows[i];
-    if (!row?.art_url) continue;
+    const sources = Array.isArray(row?.art_sources) ? row.art_sources : [];
+    if (!sources.length) continue;
 
-    let fp = cache.get(row.art_url);
-    if (!fp) {
-      try {
-        // eslint-disable-next-line no-await-in-loop
-        const binary = await fetchBinary(row.art_url);
-        if (!binary) continue;
-        fp = computeFingerprintFromJpegBuffer(binary, jpeg);
-      } catch {
-        fp = null;
+    for (const source of sources) {
+      if (!source?.url) continue;
+
+      let fps = cache.get(source.url);
+      if (!fps) {
+        try {
+          const binary = await fetchBinary(source.url);
+          if (!binary) continue;
+          fps = computeFingerprintFromJpegBuffer(binary, jpeg, source.source || 'art_crop');
+        } catch {
+          fps = [];
+        }
+        cache.set(source.url, fps);
       }
-      cache.set(row.art_url, fp);
-    }
 
-    if (!fp) continue;
-    const line = [
-      sanitizeTsv(row.id),
-      sanitizeTsv(row.set_code),
-      sanitizeTsv(row.collector_number),
-      sanitizeTsv(row.lang || 'en'),
-      sanitizeTsv(row.art_variant || ''),
-      String(fp.phash_hi),
-      String(fp.phash_lo),
-      String(fp.dhash_hi),
-      String(fp.dhash_lo),
-      String(fp.bucket16),
-      new Date().toISOString(),
-    ].join('\t');
+      for (const fp of fps || []) {
+        if (!fp) continue;
+        const line = [
+          sanitizeTsv(row.id),
+          sanitizeTsv(row.set_code),
+          sanitizeTsv(row.collector_number),
+          sanitizeTsv(row.lang || 'en'),
+          sanitizeTsv(`${row.art_variant || ''}|${source.source || 'art_crop'}|${fp.sourceVariant || ''}`),
+          String(fp.phash_hi),
+          String(fp.phash_lo),
+          String(fp.dhash_hi),
+          String(fp.dhash_lo),
+          String(fp.bucket16),
+          new Date().toISOString(),
+        ].join('\t');
 
-    if (!stream.write(`${line}\n`)) {
-      // eslint-disable-next-line no-await-in-loop
-      await once(stream, 'drain');
+        if (!stream.write(`${line}\n`)) {
+          await once(stream, 'drain');
+        }
+        count += 1;
+      }
     }
-    count += 1;
-    if (count % Math.max(1, progressEvery) === 0) {
+    if (count > 0 && count % Math.max(1, progressEvery) === 0) {
       const elapsedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
       const rate = Math.round(count / elapsedSec);
-      console.log(`[fingerprints] ${count}/${maxRows} rows (${rate}/s)`);
+      console.log(`[fingerprints] ${count} entries from ${maxRows} cards (${rate}/s)`);
     }
   }
 

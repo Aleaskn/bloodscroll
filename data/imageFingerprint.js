@@ -6,6 +6,7 @@ import {
   computeDHash64FromGrayscale,
   computePHash64FromGrayscale,
   deriveBucket16FromHi,
+  normalizeGrayscaleContrast,
   rgbaToGrayscale,
   splitHex64ToHiLo,
 } from './fingerprintCore.mjs';
@@ -73,6 +74,41 @@ function resolveArtworkFrame(artworkFrameInCard = {}) {
   };
 }
 
+function clampArtworkFrame(frame) {
+  const widthInCard = Math.min(0.96, Math.max(0.3, clamp01(frame.widthInCard, 0.84)));
+  const heightInCard = Math.min(0.8, Math.max(0.2, clamp01(frame.heightInCard, 0.46)));
+  const leftInCard = Math.min(1 - widthInCard, Math.max(0, clamp01(frame.leftInCard, 0.08)));
+  const topInCard = Math.min(1 - heightInCard, Math.max(0, clamp01(frame.topInCard, 0.18)));
+  return { leftInCard, topInCard, widthInCard, heightInCard };
+}
+
+function buildArtworkVariants(baseFrame, maxVariants = 5) {
+  const seeds = [
+    { dx: 0, dy: 0, scale: 1, tag: 'base' },
+    { dx: -0.06, dy: 0, scale: 1, tag: 'left' },
+    { dx: 0.06, dy: 0, scale: 1, tag: 'right' },
+    { dx: 0, dy: -0.05, scale: 1, tag: 'up' },
+    { dx: 0, dy: 0.05, scale: 1, tag: 'down' },
+    { dx: 0, dy: 0, scale: 0.92, tag: 'tight' },
+    { dx: 0, dy: 0, scale: 1.08, tag: 'wide' },
+  ];
+
+  return seeds.slice(0, Math.max(1, maxVariants)).map((seed, index) => {
+    const width = baseFrame.widthInCard * seed.scale;
+    const height = baseFrame.heightInCard * seed.scale;
+    return {
+      frame: clampArtworkFrame({
+        leftInCard: baseFrame.leftInCard + seed.dx - (width - baseFrame.widthInCard) / 2,
+        topInCard: baseFrame.topInCard + seed.dy - (height - baseFrame.heightInCard) / 2,
+        widthInCard: width,
+        heightInCard: height,
+      }),
+      tag: seed.tag,
+      index,
+    };
+  });
+}
+
 function buildCardCropAction(cardFrame, imageSize) {
   const imageWidth = Number(imageSize?.width || 0);
   const imageHeight = Number(imageSize?.height || 0);
@@ -113,12 +149,18 @@ async function getImageSize(imageUri) {
 }
 
 export async function createImageFingerprint(imageUri, options = {}) {
-  if (!imageUri) return null;
+  const fingerprints = await createImageFingerprintCandidates(imageUri, { ...options, maxVariants: 1 });
+  return fingerprints[0] || null;
+}
+
+export async function createImageFingerprintCandidates(imageUri, options = {}) {
+  if (!imageUri) return [];
 
   const tempUris = [];
   try {
     const cardFrame = resolveCardFrame(options.cardFrame || {});
     const artworkFrame = resolveArtworkFrame(options.artworkFrameInCard || {});
+    const variants = buildArtworkVariants(artworkFrame, Number(options.maxVariants) || 5);
     const imageSize = await getImageSize(imageUri);
     const cardCrop = buildCardCropAction(cardFrame, imageSize);
 
@@ -136,41 +178,50 @@ export async function createImageFingerprint(imageUri, options = {}) {
 
     const cardWidth = cardPreview?.width ?? imageSize.width;
     const cardHeight = cardPreview?.height ?? imageSize.height;
-    const artworkCrop = buildArtworkCropAction(artworkFrame, cardWidth, cardHeight);
+    const results = [];
+    for (const variant of variants) {
+      const artworkCrop = buildArtworkCropAction(variant.frame, cardWidth, cardHeight);
+      const phashPreview = await buildBase64Preview(cardUri, [artworkCrop], 32, 32);
+      const dhashPreview = await buildBase64Preview(cardUri, [artworkCrop], 9, 8);
+      if (phashPreview.uri && phashPreview.uri !== cardUri) tempUris.push(phashPreview.uri);
+      if (dhashPreview.uri && dhashPreview.uri !== cardUri) tempUris.push(dhashPreview.uri);
 
-    const phashPreview = await buildBase64Preview(cardUri, [artworkCrop], 32, 32);
-    const dhashPreview = await buildBase64Preview(cardUri, [artworkCrop], 9, 8);
-    if (phashPreview.uri && phashPreview.uri !== cardUri) tempUris.push(phashPreview.uri);
-    if (dhashPreview.uri && dhashPreview.uri !== cardUri) tempUris.push(dhashPreview.uri);
+      const phashImage = await decodeJpegBase64(phashPreview.base64);
+      const dhashImage = await decodeJpegBase64(dhashPreview.base64);
+      if (!phashImage || !dhashImage) continue;
 
-    const phashImage = await decodeJpegBase64(phashPreview.base64);
-    const dhashImage = await decodeJpegBase64(dhashPreview.base64);
-    if (!phashImage || !dhashImage) return null;
+      const pGray = normalizeGrayscaleContrast(
+        rgbaToGrayscale(phashImage.data, phashImage.width, phashImage.height)
+      );
+      const dGray = normalizeGrayscaleContrast(
+        rgbaToGrayscale(dhashImage.data, dhashImage.width, dhashImage.height)
+      );
 
-    const pGray = rgbaToGrayscale(phashImage.data, phashImage.width, phashImage.height);
-    const dGray = rgbaToGrayscale(dhashImage.data, dhashImage.width, dhashImage.height);
+      const phashHex = computePHash64FromGrayscale(pGray, phashImage.width, phashImage.height);
+      const dhashHex = computeDHash64FromGrayscale(dGray, dhashImage.width, dhashImage.height);
+      const pSplit = splitHex64ToHiLo(phashHex);
+      const dSplit = splitHex64ToHiLo(dhashHex);
+      if (!pSplit || !dSplit) continue;
 
-    const phashHex = computePHash64FromGrayscale(pGray, phashImage.width, phashImage.height);
-    const dhashHex = computeDHash64FromGrayscale(dGray, dhashImage.width, dhashImage.height);
-    const pSplit = splitHex64ToHiLo(phashHex);
-    const dSplit = splitHex64ToHiLo(dhashHex);
-    if (!pSplit || !dSplit) return null;
+      results.push({
+        phash64: phashHex,
+        dhash64: dhashHex,
+        phash_hi: pSplit.hi,
+        phash_lo: pSplit.lo,
+        dhash_hi: dSplit.hi,
+        dhash_lo: dSplit.lo,
+        bucket16: deriveBucket16FromHi(pSplit.hi),
+        variant: variant.tag,
+        variantIndex: variant.index,
+      });
+    }
 
-    return {
-      phash64: phashHex,
-      dhash64: dhashHex,
-      phash_hi: pSplit.hi,
-      phash_lo: pSplit.lo,
-      dhash_hi: dSplit.hi,
-      dhash_lo: dSplit.lo,
-      bucket16: deriveBucket16FromHi(pSplit.hi),
-    };
+    return results;
   } catch {
-    return null;
+    return [];
   } finally {
     for (const uri of tempUris) {
       if (uri && uri !== imageUri) {
-        // eslint-disable-next-line no-await-in-loop
         await FileSystem.deleteAsync(uri, { idempotent: true }).catch(() => {});
       }
     }

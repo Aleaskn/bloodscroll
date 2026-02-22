@@ -225,47 +225,81 @@ export async function searchFingerprintCandidatesByBucket(
 
   const normalizedLimit = Math.max(1, Math.min(300, Number(limit) || 80));
   const range = Math.max(0, Math.min(6, Number(neighborRange) || 1));
-  const bucketMin = Math.max(0, bucket - range);
-  const bucketMax = Math.min(65535, bucket + range);
   const normalizedSet = String(setCode ?? '').trim().toLowerCase();
   const normalizedCollector = normalizeCollectorNumber(collectorNumber);
   const hasEditionFilter = normalizedSet || normalizedCollector;
 
   const db = await getCatalogDb();
-  const rows = await db.getAllAsync(
-    `SELECT
-       f.card_id,
-       c.name,
-       f.set_code,
-       f.collector_number,
-       f.lang,
-       f.art_variant,
-       f.phash_hi,
-       f.phash_lo,
-       f.dhash_hi,
-       f.dhash_lo,
-       f.bucket16
-     FROM catalog_card_fingerprint f
-     JOIN catalog_cards c ON c.id = f.card_id
-     WHERE f.bucket16 BETWEEN ? AND ?
-       AND (
-         ? = 0 OR
-         ((? = '' OR f.set_code = ?) AND (? = '' OR f.collector_number = ?))
-       )
-     LIMIT ?;`,
-    [
-      bucketMin,
-      bucketMax,
-      hasEditionFilter ? 1 : 0,
-      normalizedSet,
-      normalizedSet,
-      normalizedCollector,
-      normalizedCollector,
-      normalizedLimit,
-    ]
-  );
 
-  return rows ?? [];
+  const runBucketQuery = async ({ min, max, includeExactBucket = true, perLimit = normalizedLimit }) => {
+    const rows = await db.getAllAsync(
+      `SELECT
+         f.card_id,
+         c.name,
+         f.set_code,
+         f.collector_number,
+         f.lang,
+         f.art_variant,
+         f.phash_hi,
+         f.phash_lo,
+         f.dhash_hi,
+         f.dhash_lo,
+         f.bucket16
+       FROM catalog_card_fingerprint f INDEXED BY idx_fingerprint_bucket16
+       JOIN catalog_cards c ON c.id = f.card_id
+       WHERE f.bucket16 BETWEEN ? AND ?
+         AND (? = 1 OR f.bucket16 != ?)
+         AND (
+           ? = 0 OR
+           ((? = '' OR f.set_code = ?) AND (? = '' OR f.collector_number = ?))
+         )
+       ORDER BY ABS(f.bucket16 - ?)
+       LIMIT ?;`,
+      [
+        min,
+        max,
+        includeExactBucket ? 1 : 0,
+        bucket,
+        hasEditionFilter ? 1 : 0,
+        normalizedSet,
+        normalizedSet,
+        normalizedCollector,
+        normalizedCollector,
+        bucket,
+        perLimit,
+      ]
+    );
+    return rows ?? [];
+  };
+
+  const exactRows = await runBucketQuery({
+    min: bucket,
+    max: bucket,
+    includeExactBucket: true,
+    perLimit: normalizedLimit,
+  });
+  if (range === 0 || exactRows.length >= normalizedLimit) {
+    return exactRows.slice(0, normalizedLimit);
+  }
+
+  const neighborRows = await runBucketQuery({
+    min: Math.max(0, bucket - range),
+    max: Math.min(65535, bucket + range),
+    includeExactBucket: false,
+    perLimit: Math.max(1, normalizedLimit - exactRows.length),
+  });
+
+  const merged = [];
+  const seen = new Set();
+  for (const row of [...exactRows, ...neighborRows]) {
+    const key = `${row.card_id}:${row.phash_hi}:${row.phash_lo}:${row.dhash_hi}:${row.dhash_lo}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(row);
+    if (merged.length >= normalizedLimit) break;
+  }
+
+  return merged;
 }
 
 export async function getFingerprintStats() {
