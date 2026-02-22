@@ -65,16 +65,7 @@ function resolveCardFrame(cardFrame = {}) {
   };
 }
 
-function resolveArtworkFrame(artworkFrameInCard = {}) {
-  return {
-    leftInCard: clamp01(artworkFrameInCard.leftInCard, 0.08),
-    topInCard: clamp01(artworkFrameInCard.topInCard, 0.18),
-    widthInCard: clamp01(artworkFrameInCard.widthInCard, 0.84),
-    heightInCard: clamp01(artworkFrameInCard.heightInCard, 0.46),
-  };
-}
-
-function clampArtworkFrame(frame) {
+function clampRegionFrame(frame) {
   const widthInCard = Math.min(0.96, Math.max(0.3, clamp01(frame.widthInCard, 0.84)));
   const heightInCard = Math.min(0.8, Math.max(0.2, clamp01(frame.heightInCard, 0.46)));
   const leftInCard = Math.min(1 - widthInCard, Math.max(0, clamp01(frame.leftInCard, 0.08)));
@@ -82,22 +73,39 @@ function clampArtworkFrame(frame) {
   return { leftInCard, topInCard, widthInCard, heightInCard };
 }
 
-function buildArtworkVariants(baseFrame, maxVariants = 5) {
+function resolveHashRegionFrame(regionFrameInCard = {}, regionMode = 'full_card') {
+  if (regionMode === 'full_card') {
+    return {
+      leftInCard: clamp01(regionFrameInCard.leftInCard, 0.02),
+      topInCard: clamp01(regionFrameInCard.topInCard, 0.02),
+      widthInCard: clamp01(regionFrameInCard.widthInCard, 0.96),
+      heightInCard: clamp01(regionFrameInCard.heightInCard, 0.96),
+    };
+  }
+  return {
+    leftInCard: clamp01(regionFrameInCard.leftInCard, 0.08),
+    topInCard: clamp01(regionFrameInCard.topInCard, 0.18),
+    widthInCard: clamp01(regionFrameInCard.widthInCard, 0.84),
+    heightInCard: clamp01(regionFrameInCard.heightInCard, 0.46),
+  };
+}
+
+function buildRegionVariants(baseFrame, maxVariants = 5, regionMode = 'full_card') {
   const seeds = [
     { dx: 0, dy: 0, scale: 1, tag: 'base' },
-    { dx: -0.06, dy: 0, scale: 1, tag: 'left' },
-    { dx: 0.06, dy: 0, scale: 1, tag: 'right' },
-    { dx: 0, dy: -0.05, scale: 1, tag: 'up' },
-    { dx: 0, dy: 0.05, scale: 1, tag: 'down' },
-    { dx: 0, dy: 0, scale: 0.92, tag: 'tight' },
-    { dx: 0, dy: 0, scale: 1.08, tag: 'wide' },
+    { dx: -0.04, dy: 0, scale: 1, tag: 'left' },
+    { dx: 0.04, dy: 0, scale: 1, tag: 'right' },
+    { dx: 0, dy: -0.04, scale: 1, tag: 'up' },
+    { dx: 0, dy: 0.04, scale: 1, tag: 'down' },
+    { dx: 0, dy: 0, scale: regionMode === 'full_card' ? 0.98 : 0.92, tag: 'tight' },
+    { dx: 0, dy: 0, scale: regionMode === 'full_card' ? 1.02 : 1.08, tag: 'wide' },
   ];
 
   return seeds.slice(0, Math.max(1, maxVariants)).map((seed, index) => {
     const width = baseFrame.widthInCard * seed.scale;
     const height = baseFrame.heightInCard * seed.scale;
     return {
-      frame: clampArtworkFrame({
+      frame: clampRegionFrame({
         leftInCard: baseFrame.leftInCard + seed.dx - (width - baseFrame.widthInCard) / 2,
         topInCard: baseFrame.topInCard + seed.dy - (height - baseFrame.heightInCard) / 2,
         widthInCard: width,
@@ -159,8 +167,9 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
   const tempUris = [];
   try {
     const cardFrame = resolveCardFrame(options.cardFrame || {});
-    const artworkFrame = resolveArtworkFrame(options.artworkFrameInCard || {});
-    const variants = buildArtworkVariants(artworkFrame, Number(options.maxVariants) || 5);
+    const regionMode = options.regionMode === 'artwork' ? 'artwork' : 'full_card';
+    const regionFrame = resolveHashRegionFrame(options.regionFrameInCard || options.artworkFrameInCard || {}, regionMode);
+    const variants = buildRegionVariants(regionFrame, Number(options.maxVariants) || 5, regionMode);
     const imageSize = await getImageSize(imageUri);
     const cardCrop = buildCardCropAction(cardFrame, imageSize);
 
@@ -180,9 +189,9 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
     const cardHeight = cardPreview?.height ?? imageSize.height;
     const results = [];
     for (const variant of variants) {
-      const artworkCrop = buildArtworkCropAction(variant.frame, cardWidth, cardHeight);
-      const phashPreview = await buildBase64Preview(cardUri, [artworkCrop], 32, 32);
-      const dhashPreview = await buildBase64Preview(cardUri, [artworkCrop], 9, 8);
+      const regionCrop = buildArtworkCropAction(variant.frame, cardWidth, cardHeight);
+      const phashPreview = await buildBase64Preview(cardUri, [regionCrop], 32, 32);
+      const dhashPreview = await buildBase64Preview(cardUri, [regionCrop], 9, 8);
       if (phashPreview.uri && phashPreview.uri !== cardUri) tempUris.push(phashPreview.uri);
       if (dhashPreview.uri && dhashPreview.uri !== cardUri) tempUris.push(dhashPreview.uri);
 

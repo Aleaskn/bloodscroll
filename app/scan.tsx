@@ -26,11 +26,11 @@ const EDITION_FRAME = {
   widthInCard: 0.5,
   heightInCard: 0.065,
 };
-const ARTWORK_FRAME = {
-  leftInCard: 0.08,
-  topInCard: 0.18,
-  widthInCard: 0.84,
-  heightInCard: 0.46,
+const FULL_CARD_HASH_FRAME = {
+  leftInCard: 0.02,
+  topInCard: 0.02,
+  widthInCard: 0.96,
+  heightInCard: 0.96,
 };
 const DECISION_CONFIDENCE_THRESHOLD = 0.95;
 const DECISION_STABLE_FRAMES = 2;
@@ -342,7 +342,7 @@ export default function ScanScreen() {
         imageUri: capturedUri,
         cardFrame: CARD_FRAME,
         editionFrameInCard: EDITION_FRAME,
-        artworkFrameInCard: ARTWORK_FRAME,
+        fullCardFrameInCard: FULL_CARD_HASH_FRAME,
         enableMultilingualFallback: scanSettings.multilingualFallback,
         allowOcrFallback: shouldAllowOcrFallback,
         skipEditionOcrInPrimary: usingHybrid,

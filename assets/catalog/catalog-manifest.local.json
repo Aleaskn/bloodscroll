@@ -1,10 +1,10 @@
 {
-  "version": "2026-02-21",
-  "generatedAt": "2026-02-22T00:44:15.279Z",
+  "version": "2026-02-22",
+  "generatedAt": "2026-02-22T17:48:08.761Z",
   "cards": 110087,
   "aliases": 112381,
-  "fingerprints": 682640,
-  "md5": "081360f1fdf20cd59a22b8f4ddd22f3e",
-  "source": "https://data.scryfall.io/default-cards/default-cards-20260221100742.json",
+  "fingerprints": 682644,
+  "md5": "0d92318dfd7dd2e3c9bb482c975ae4f7",
+  "source": "https://data.scryfall.io/default-cards/default-cards-20260222101238.json",
   "dbUrl": "REPLACE_ME_WITH_RELEASE_ASSET_URL"
 }

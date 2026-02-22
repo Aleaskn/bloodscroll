@@ -189,7 +189,8 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
   let bestFingerprintNoneDebug = null;
   const fingerprintCandidates = await createImageFingerprintCandidates(imageUri, {
     cardFrame,
-    artworkFrameInCard: frameMeta.artworkFrameInCard,
+    regionMode: 'full_card',
+    regionFrameInCard: frameMeta.fullCardFrameInCard,
     maxVariants: 5,
   });
 

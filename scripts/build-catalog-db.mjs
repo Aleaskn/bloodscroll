@@ -145,19 +145,19 @@ function pickCardFields(card) {
 
 function getCardArtSources(card) {
   const sources = [];
-  if (card?.image_uris?.art_crop) {
-    sources.push({ url: String(card.image_uris.art_crop), source: 'art_crop' });
-  }
   if (card?.image_uris?.normal) {
     sources.push({ url: String(card.image_uris.normal), source: 'normal' });
   }
+  if (card?.image_uris?.art_crop) {
+    sources.push({ url: String(card.image_uris.art_crop), source: 'art_crop' });
+  }
   if (Array.isArray(card?.card_faces)) {
     for (const face of card.card_faces) {
-      if (face?.image_uris?.art_crop) {
-        sources.push({ url: String(face.image_uris.art_crop), source: 'art_crop' });
-      }
       if (face?.image_uris?.normal) {
         sources.push({ url: String(face.image_uris.normal), source: 'normal' });
+      }
+      if (face?.image_uris?.art_crop) {
+        sources.push({ url: String(face.image_uris.art_crop), source: 'art_crop' });
       }
     }
   }
@@ -331,14 +331,15 @@ function cropGrayscale(gray, width, height, frame) {
   return { gray: out, width: cropWidth, height: cropHeight };
 }
 
-function buildArtworkFramesForNormal() {
-  const base = { leftInCard: 0.08, topInCard: 0.18, widthInCard: 0.84, heightInCard: 0.46 };
+function buildFullCardFramesForNormal() {
+  const base = { leftInCard: 0.02, topInCard: 0.02, widthInCard: 0.96, heightInCard: 0.96 };
   const variants = [
     { ...base, tag: 'normal_base' },
-    { ...base, leftInCard: 0.04, tag: 'normal_left' },
-    { ...base, leftInCard: 0.12, tag: 'normal_right' },
-    { ...base, topInCard: 0.14, tag: 'normal_up' },
-    { ...base, topInCard: 0.22, tag: 'normal_down' },
+    { ...base, leftInCard: 0.0, tag: 'normal_left' },
+    { ...base, leftInCard: 0.04, tag: 'normal_right' },
+    { ...base, topInCard: 0.0, tag: 'normal_up' },
+    { ...base, topInCard: 0.04, tag: 'normal_down' },
+    { ...base, leftInCard: 0.03, topInCard: 0.03, widthInCard: 0.94, heightInCard: 0.94, tag: 'normal_tight' },
   ];
   return variants.map((entry) => ({
     ...entry,
@@ -375,7 +376,7 @@ function computeFingerprintFromJpegBuffer(buffer, jpeg, sourceType = 'art_crop')
 
   if (sourceType === 'normal') {
     const fingerprints = [];
-    for (const frame of buildArtworkFramesForNormal()) {
+    for (const frame of buildFullCardFramesForNormal()) {
       const cropped = cropGrayscale(gray, decoded.width, decoded.height, frame);
       const fp = computeFingerprintFromGrayscale(cropped.gray, cropped.width, cropped.height);
       if (fp) {
@@ -388,8 +389,9 @@ function computeFingerprintFromJpegBuffer(buffer, jpeg, sourceType = 'art_crop')
     return fingerprints;
   }
 
+  // Keep art-crop fallback only for printings without normal image.
   const fp = computeFingerprintFromGrayscale(gray, decoded.width, decoded.height);
-  return fp ? [{ ...fp, sourceVariant: 'art_crop_base' }] : [];
+  return fp ? [{ ...fp, sourceVariant: 'art_crop_fallback' }] : [];
 }
 
 async function fetchBinary(url) {
@@ -418,7 +420,9 @@ async function writeFingerprintTsv(
 
   for (let i = 0; i < maxRows; i += 1) {
     const row = englishRows[i];
-    const sources = Array.isArray(row?.art_sources) ? row.art_sources : [];
+    const allSources = Array.isArray(row?.art_sources) ? row.art_sources : [];
+    const normalSources = allSources.filter((entry) => entry?.source === 'normal');
+    const sources = normalSources.length ? normalSources : allSources;
     if (!sources.length) continue;
 
     for (const source of sources) {
