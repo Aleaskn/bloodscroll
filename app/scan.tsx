@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, FlatList, Modal, Pressable, Text, View } from 'react-native';
+import { ActivityIndicator, FlatList, Image, Modal, Pressable, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
@@ -10,6 +10,7 @@ import { processFrameAndResolveCard } from '../data/scanEngine';
 import { isOnDeviceOcrAvailable } from '../data/ocrOnDevice';
 import { recordScanMetric } from '../data/scanMetrics';
 import { getScanSettings, SCANNER_ENGINES } from '../data/scanSettings';
+import { HASH_GRAYSCALE_BIT_DEPTH, HASH_RESIZE_ALGO, MTG_CARD_ASPECT_RATIO } from '../data/hashConfig';
 
 const LEGACY_SCAN_INTERVAL_MS = 1200;
 const HYBRID_SCAN_INTERVAL_MS = 260;
@@ -18,7 +19,7 @@ const CARD_FRAME = {
   left: 0.18,
   top: 0.22,
   width: 0.64,
-  aspectRatio: 2.5 / 3.5,
+  aspectRatio: MTG_CARD_ASPECT_RATIO,
 };
 const EDITION_FRAME = {
   leftInCard: 0.035,
@@ -89,6 +90,7 @@ export default function ScanScreen() {
     rawHits: '-',
     minHamming: '-',
     minHamSwap: '-',
+    hashPreviewUri: '',
   });
   const [candidates, setCandidates] = useState<any[]>([]);
   const CameraView = cameraModule?.CameraView;
@@ -127,6 +129,17 @@ export default function ScanScreen() {
   useEffect(() => {
     hasCandidatesRef.current = hasCandidates;
   }, [hasCandidates]);
+
+  useEffect(() => {
+    if (!isFocused || hasCandidates) return;
+    if (pausedRef.current || navigatedRef.current || scanInFlightRef.current) {
+      pausedRef.current = false;
+      navigatedRef.current = false;
+      scanInFlightRef.current = false;
+      clearScanningTimer();
+      setHintText('Point your camera at a card');
+    }
+  }, [isFocused, hasCandidates, clearScanningTimer]);
 
   const refreshScanSettings = useCallback(async () => {
     const next = await getScanSettings();
@@ -251,6 +264,7 @@ export default function ScanScreen() {
         rawHits: '-',
         minHamming: '-',
         minHamSwap: '-',
+        hashPreviewUri: '',
       });
       if (catalogReady) setHintText('Point your camera at a card');
       return () => {
@@ -358,12 +372,17 @@ export default function ScanScreen() {
           rawHits: String(cycleDebug.rawHitsCount ?? '-'),
           minHamming: String(cycleDebug.minHammingDistance ?? '-'),
           minHamSwap: String(cycleDebug.minHammingDistanceSwapHiLo ?? '-'),
+          hashPreviewUri: cycleDebug.hashPreviewBase64
+            ? `data:image/jpeg;base64,${cycleDebug.hashPreviewBase64}`
+            : '',
         });
       } else {
         setDebugOverlay((prev) => ({
           ...prev,
           rawHits: '-',
           minHamming: '-',
+          minHamSwap: '-',
+          hashPreviewUri: '',
         }));
       }
 
@@ -635,6 +654,23 @@ export default function ScanScreen() {
                     <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
                       perm:{permission} cam:{cameraReady ? '1' : '0'} cat:{catalogReady ? '1' : '0'}
                     </Text>
+                    <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
+                      scan:{canScan ? '1' : '0'} focus:{isFocused ? '1' : '0'} busy:{busy ? '1' : '0'} modal:
+                      {hasCandidates ? '1' : '0'}
+                    </Text>
+                    <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
+                      resize:{HASH_RESIZE_ALGO} gray:{HASH_GRAYSCALE_BIT_DEPTH}bit ar:
+                      {MTG_CARD_ASPECT_RATIO.toFixed(3)}
+                    </Text>
+                    {debugOverlay.hashPreviewUri ? (
+                      <View style={{ marginTop: 4, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                        <Text style={{ color: '#9fb2c9', fontSize: 10 }}>hash-img:</Text>
+                        <Image
+                          source={{ uri: debugOverlay.hashPreviewUri }}
+                          style={{ width: 48, height: 48, borderRadius: 4, borderWidth: 1, borderColor: '#5b6470' }}
+                        />
+                      </View>
+                    ) : null}
                   </View>
                 ) : null}
               </View>

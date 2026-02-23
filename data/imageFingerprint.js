@@ -6,10 +6,17 @@ import {
   computeDHash64FromGrayscale,
   computePHash64FromGrayscale,
   deriveBucket16FromHi,
-  normalizeGrayscaleContrast,
+  preprocessGrayscaleForHash,
+  resizeGrayscaleNearest,
   rgbaToGrayscale,
   splitHex64ToHiLo,
 } from './fingerprintCore.mjs';
+import {
+  HASH_D_HEIGHT,
+  HASH_D_WIDTH,
+  HASH_P_SIZE,
+  MTG_CARD_ASPECT_RATIO,
+} from './hashConfig';
 
 let jpegModulePromise = null;
 
@@ -29,10 +36,10 @@ function clamp01(value, fallback) {
   return n;
 }
 
-async function buildBase64Preview(imageUri, actions, width, height) {
+async function buildBase64Preview(imageUri, actions) {
   const result = await ImageManipulator.manipulateAsync(
     imageUri,
-    [...actions, { resize: { width, height } }],
+    [...actions],
     {
       compress: 1,
       format: ImageManipulator.SaveFormat.JPEG,
@@ -43,6 +50,28 @@ async function buildBase64Preview(imageUri, actions, width, height) {
     uri: result?.uri ?? null,
     base64: result?.base64 ?? '',
   };
+}
+
+function grayscaleToRgba(gray, width, height) {
+  const rgba = new Uint8Array(width * height * 4);
+  for (let i = 0; i < gray.length; i += 1) {
+    const v = gray[i];
+    const o = i * 4;
+    rgba[o] = v;
+    rgba[o + 1] = v;
+    rgba[o + 2] = v;
+    rgba[o + 3] = 255;
+  }
+  return rgba;
+}
+
+async function encodeDebugPreviewBase64(gray32) {
+  const jpeg = await getJpegModule();
+  if (!jpeg || typeof jpeg.encode !== 'function') return '';
+  const rgba = grayscaleToRgba(gray32, HASH_P_SIZE, HASH_P_SIZE);
+  const encoded = jpeg.encode({ data: rgba, width: HASH_P_SIZE, height: HASH_P_SIZE }, 80);
+  if (!encoded?.data) return '';
+  return Buffer.from(encoded.data).toString('base64');
 }
 
 async function decodeJpegBase64(base64) {
@@ -126,8 +155,9 @@ function buildCardCropAction(cardFrame, imageSize) {
   const top = clamp01(cardFrame.top, 0);
   const widthRatio = clamp01(cardFrame.width, 1);
   let heightRatio = clamp01(cardFrame.height, 1);
-  if (!heightRatio && cardFrame.aspectRatio > 0) {
-    heightRatio = (widthRatio * imageWidth) / (cardFrame.aspectRatio * imageHeight);
+  const enforcedAspectRatio = MTG_CARD_ASPECT_RATIO;
+  if (!heightRatio) {
+    heightRatio = (widthRatio * imageWidth) / (enforcedAspectRatio * imageHeight);
   }
 
   const originX = Math.max(0, Math.round(imageWidth * left));
@@ -166,6 +196,7 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
 
   const tempUris = [];
   try {
+    const includeDebugPreview = !!options.includeDebugPreview;
     const cardFrame = resolveCardFrame(options.cardFrame || {});
     const regionMode = options.regionMode === 'artwork' ? 'artwork' : 'full_card';
     const regionFrame = resolveHashRegionFrame(options.regionFrameInCard || options.artworkFrameInCard || {}, regionMode);
@@ -190,27 +221,35 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
     const results = [];
     for (const variant of variants) {
       const regionCrop = buildArtworkCropAction(variant.frame, cardWidth, cardHeight);
-      const phashPreview = await buildBase64Preview(cardUri, [regionCrop], 32, 32);
-      const dhashPreview = await buildBase64Preview(cardUri, [regionCrop], 9, 8);
-      if (phashPreview.uri && phashPreview.uri !== cardUri) tempUris.push(phashPreview.uri);
-      if (dhashPreview.uri && dhashPreview.uri !== cardUri) tempUris.push(dhashPreview.uri);
+      const cropped = await buildBase64Preview(cardUri, [regionCrop]);
+      if (cropped.uri && cropped.uri !== cardUri) tempUris.push(cropped.uri);
+      const decoded = await decodeJpegBase64(cropped.base64);
+      if (!decoded) continue;
 
-      const phashImage = await decodeJpegBase64(phashPreview.base64);
-      const dhashImage = await decodeJpegBase64(dhashPreview.base64);
-      if (!phashImage || !dhashImage) continue;
-
-      const pGray = normalizeGrayscaleContrast(
-        rgbaToGrayscale(phashImage.data, phashImage.width, phashImage.height)
+      const gray = preprocessGrayscaleForHash(
+        rgbaToGrayscale(decoded.data, decoded.width, decoded.height)
       );
-      const dGray = normalizeGrayscaleContrast(
-        rgbaToGrayscale(dhashImage.data, dhashImage.width, dhashImage.height)
+      const pInput = resizeGrayscaleNearest(
+        gray,
+        decoded.width,
+        decoded.height,
+        HASH_P_SIZE,
+        HASH_P_SIZE
+      );
+      const dInput = resizeGrayscaleNearest(
+        gray,
+        decoded.width,
+        decoded.height,
+        HASH_D_WIDTH,
+        HASH_D_HEIGHT
       );
 
-      const phashHex = computePHash64FromGrayscale(pGray, phashImage.width, phashImage.height);
-      const dhashHex = computeDHash64FromGrayscale(dGray, dhashImage.width, dhashImage.height);
+      const phashHex = computePHash64FromGrayscale(pInput, HASH_P_SIZE, HASH_P_SIZE);
+      const dhashHex = computeDHash64FromGrayscale(dInput, HASH_D_WIDTH, HASH_D_HEIGHT);
       const pSplit = splitHex64ToHiLo(phashHex);
       const dSplit = splitHex64ToHiLo(dhashHex);
       if (!pSplit || !dSplit) continue;
+      const debugPreviewBase64 = includeDebugPreview ? await encodeDebugPreviewBase64(pInput) : '';
 
       results.push({
         phash64: phashHex,
@@ -222,6 +261,7 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
         bucket16: deriveBucket16FromHi(pSplit.hi),
         variant: variant.tag,
         variantIndex: variant.index,
+        hashPreviewBase64: debugPreviewBase64,
       });
     }
 

@@ -192,6 +192,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
     regionMode: 'full_card',
     regionFrameInCard: frameMeta.fullCardFrameInCard,
     maxVariants: 5,
+    includeDebugPreview: true,
   });
 
   if (Array.isArray(fingerprintCandidates) && fingerprintCandidates.length) {
@@ -216,6 +217,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
           debug: {
             ...(fingerprintResult.debug || {}),
             variant: fingerprint.variant ?? null,
+            hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
           },
         };
         if (!bestMatched || Number(withDebug.confidence ?? 0) > Number(bestMatched.confidence ?? 0)) {
@@ -250,6 +252,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
             debug: {
               ...(fingerprintResult.debug || {}),
               variant: fingerprint.variant ?? null,
+              hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
             },
           };
         }
@@ -265,6 +268,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
           debug: {
             ...(fingerprintResult.debug || {}),
             variant: fingerprint.variant ?? null,
+            hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
           },
         };
 
@@ -283,6 +287,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
         const candidateNoneDebug = {
           ...(fingerprintResult.debug || {}),
           variant: fingerprint.variant ?? null,
+          hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
         };
         if (!bestFingerprintNoneDebug) {
           bestFingerprintNoneDebug = candidateNoneDebug;

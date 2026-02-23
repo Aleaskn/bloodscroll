@@ -12,10 +12,16 @@ import {
   computeDHash64FromGrayscale,
   computePHash64FromGrayscale,
   deriveBucket16FromHi,
-  normalizeGrayscaleContrast,
+  preprocessGrayscaleForHash,
+  resizeGrayscaleNearest,
   rgbaToGrayscale,
   splitHex64ToHiLo,
 } from '../data/fingerprintCore.mjs';
+import {
+  HASH_D_HEIGHT,
+  HASH_D_WIDTH,
+  HASH_P_SIZE,
+} from '../data/hashConfig.js';
 
 let jpegModulePromise = null;
 
@@ -293,18 +299,6 @@ async function writeCatalogTsvs(cards, cardsTsvPath, aliasesTsvPath) {
   };
 }
 
-function resizeGrayscaleNearest(gray, srcWidth, srcHeight, dstWidth, dstHeight) {
-  const out = new Uint8Array(dstWidth * dstHeight);
-  for (let y = 0; y < dstHeight; y += 1) {
-    const srcY = Math.min(srcHeight - 1, Math.round((y / dstHeight) * srcHeight));
-    for (let x = 0; x < dstWidth; x += 1) {
-      const srcX = Math.min(srcWidth - 1, Math.round((x / dstWidth) * srcWidth));
-      out[y * dstWidth + x] = gray[srcY * srcWidth + srcX];
-    }
-  }
-  return out;
-}
-
 function clamp01(value, fallback = 0) {
   const n = Number(value);
   if (!Number.isFinite(n)) return fallback;
@@ -351,11 +345,11 @@ function buildFullCardFramesForNormal() {
 }
 
 function computeFingerprintFromGrayscale(gray, width, height) {
-  const normalized = normalizeGrayscaleContrast(gray);
-  const pInput = resizeGrayscaleNearest(normalized, width, height, 32, 32);
-  const dInput = resizeGrayscaleNearest(normalized, width, height, 9, 8);
-  const phash64 = computePHash64FromGrayscale(pInput, 32, 32);
-  const dhash64 = computeDHash64FromGrayscale(dInput, 9, 8);
+  const normalized = preprocessGrayscaleForHash(gray);
+  const pInput = resizeGrayscaleNearest(normalized, width, height, HASH_P_SIZE, HASH_P_SIZE);
+  const dInput = resizeGrayscaleNearest(normalized, width, height, HASH_D_WIDTH, HASH_D_HEIGHT);
+  const phash64 = computePHash64FromGrayscale(pInput, HASH_P_SIZE, HASH_P_SIZE);
+  const dhash64 = computeDHash64FromGrayscale(dInput, HASH_D_WIDTH, HASH_D_HEIGHT);
   const pSplit = splitHex64ToHiLo(phash64);
   const dSplit = splitHex64ToHiLo(dhash64);
   if (!pSplit || !dSplit) return null;

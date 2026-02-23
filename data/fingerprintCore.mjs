@@ -70,6 +70,60 @@ export function normalizeGrayscaleContrast(
   return output;
 }
 
+export function equalizeGrayscaleHistogram(gray) {
+  if (!gray || !gray.length) return new Uint8Array(0);
+  const histogram = new Uint32Array(256);
+  for (let i = 0; i < gray.length; i += 1) {
+    histogram[gray[i]] += 1;
+  }
+
+  const cdf = new Uint32Array(256);
+  let running = 0;
+  for (let i = 0; i < 256; i += 1) {
+    running += histogram[i];
+    cdf[i] = running;
+  }
+
+  let cdfMin = 0;
+  for (let i = 0; i < 256; i += 1) {
+    if (cdf[i] > 0) {
+      cdfMin = cdf[i];
+      break;
+    }
+  }
+  const total = gray.length;
+  const denom = Math.max(1, total - cdfMin);
+
+  const out = new Uint8Array(gray.length);
+  for (let i = 0; i < gray.length; i += 1) {
+    const mapped = ((cdf[gray[i]] - cdfMin) / denom) * 255;
+    out[i] = clampByte(mapped);
+  }
+  return out;
+}
+
+export function preprocessGrayscaleForHash(gray) {
+  if (!gray || !gray.length) return new Uint8Array(0);
+  const contrast = normalizeGrayscaleContrast(gray, {
+    lowPercentile: 0.02,
+    highPercentile: 0.98,
+    gamma: 1,
+  });
+  return equalizeGrayscaleHistogram(contrast);
+}
+
+export function resizeGrayscaleNearest(gray, srcWidth, srcHeight, dstWidth, dstHeight) {
+  const out = new Uint8Array(dstWidth * dstHeight);
+  for (let y = 0; y < dstHeight; y += 1) {
+    const srcY = Math.min(srcHeight - 1, Math.round((y / dstHeight) * srcHeight));
+    for (let x = 0; x < dstWidth; x += 1) {
+      const srcX = Math.min(srcWidth - 1, Math.round((x / dstWidth) * srcWidth));
+      out[y * dstWidth + x] = gray[srcY * srcWidth + srcX];
+    }
+  }
+  return out;
+}
+
 function computeDct2D(values, size) {
   const result = Array.from({ length: size }, () => new Float64Array(size));
   const coeff = Math.PI / (2 * size);
