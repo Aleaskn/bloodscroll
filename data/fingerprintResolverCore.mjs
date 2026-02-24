@@ -45,7 +45,7 @@ function buildAmbiguousFromRows(rows, confidence, matchedBy, debug, evidence = {
 }
 
 function isLooseSimilarityAcceptable(score) {
-  return Number.isFinite(score) && score <= 30;
+  return Number.isFinite(score) && score <= 24;
 }
 
 function extractEditionHintCandidates({ setCode, collectorNumber, editionText }) {
@@ -229,7 +229,7 @@ export async function resolveByFingerprintWithRepository(
       : null;
 
   const scored = scoredAll
-    .filter((row) => row.phashDistance <= 12 && row.dhashDistance <= 15)
+    .filter((row) => row.phashDistance <= 10 && row.dhashDistance <= 12)
     .sort((a, b) => a.score - b.score)
     .slice(0, 12);
   const debug = {

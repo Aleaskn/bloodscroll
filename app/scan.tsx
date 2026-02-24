@@ -35,6 +35,22 @@ const FULL_CARD_HASH_FRAME = {
 };
 const DECISION_CONFIDENCE_THRESHOLD = 0.95;
 const DECISION_STABLE_FRAMES = 2;
+const CAPTURE_TIMEOUT_MS = 3500;
+const PROCESS_TIMEOUT_MS = 7000;
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        reject(new Error(`timeout:${label}`));
+      }, timeoutMs);
+    });
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function formatEditionLabel(candidate) {
   const edition = candidate?.set_code ? String(candidate.set_code).toUpperCase() : null;
@@ -91,6 +107,10 @@ export default function ScanScreen() {
     minHamming: '-',
     minHamSwap: '-',
     hashPreviewUri: '',
+    cycleId: '0',
+    lastStage: '-',
+    lastDurationMs: '-',
+    lastError: '-',
   });
   const [candidates, setCandidates] = useState<any[]>([]);
   const CameraView = cameraModule?.CameraView;
@@ -104,6 +124,9 @@ export default function ScanScreen() {
   const firstMissAtRef = useRef<number | null>(null);
   const missStreakRef = useRef(0);
   const scanInFlightRef = useRef(false);
+  const scanCycleIdRef = useRef(0);
+  const scanWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const syntheticFrameOnceRef = useRef(true);
   const stableMatchRef = useRef<{ cardId: string; count: number }>({ cardId: '', count: 0 });
 
   const usingHybrid = scanSettings.engine === SCANNER_ENGINES.HYBRID_HASH_BETA;
@@ -113,17 +136,35 @@ export default function ScanScreen() {
     return (
       isFocused &&
       cameraAvailable &&
+      catalogReady &&
       cameraReady &&
       permission === 'granted' &&
       !hasCandidates &&
       !busy
     );
-  }, [isFocused, usingHybrid, VisionCamera, visionDevice, CameraView, cameraReady, permission, hasCandidates, busy]);
+  }, [
+    isFocused,
+    usingHybrid,
+    VisionCamera,
+    visionDevice,
+    CameraView,
+    catalogReady,
+    cameraReady,
+    permission,
+    hasCandidates,
+    busy,
+  ]);
 
   const clearScanningTimer = useCallback(() => {
     if (!scanningTimeoutRef.current) return;
     clearTimeout(scanningTimeoutRef.current);
     scanningTimeoutRef.current = null;
+  }, []);
+
+  const clearScanWatchdog = useCallback(() => {
+    if (!scanWatchdogRef.current) return;
+    clearTimeout(scanWatchdogRef.current);
+    scanWatchdogRef.current = null;
   }, []);
 
   useEffect(() => {
@@ -167,8 +208,7 @@ export default function ScanScreen() {
       } catch (setupError) {
         if (!mounted) return;
         setCatalogReady(false);
-        // Keep scan loop alive for diagnostics even if bootstrap partially fails.
-        setHintText('Scanner init partial. Running diagnostics...');
+        setHintText('Scanner init failed. Check catalog and retry.');
         setError(
           setupError instanceof Error
             ? setupError.message
@@ -265,12 +305,17 @@ export default function ScanScreen() {
         minHamming: '-',
         minHamSwap: '-',
         hashPreviewUri: '',
+        cycleId: '0',
+        lastStage: '-',
+        lastDurationMs: '-',
+        lastError: '-',
       });
       if (catalogReady) setHintText('Point your camera at a card');
       return () => {
         clearScanningTimer();
+        clearScanWatchdog();
       };
-    }, [catalogReady, clearScanningTimer, refreshScanSettings])
+    }, [catalogReady, clearScanningTimer, clearScanWatchdog, refreshScanSettings])
   );
 
   const navigateToCard = useCallback(
@@ -340,28 +385,68 @@ export default function ScanScreen() {
 
   const runScanCycle = useCallback(async () => {
     if (!canScan || pausedRef.current || navigatedRef.current || scanInFlightRef.current) return;
+    const cycleId = ++scanCycleIdRef.current;
+    const cycleStartedAt = Date.now();
     scanInFlightRef.current = true;
     setBusy(true);
+    setDebugOverlay((prev) => ({
+      ...prev,
+      cycleId: String(cycleId),
+      lastStage: 'cycle_start',
+      lastDurationMs: '-',
+    }));
+    clearScanWatchdog();
+    scanWatchdogRef.current = setTimeout(() => {
+      scanInFlightRef.current = false;
+      setBusy(false);
+      setDebugOverlay((prev) => ({
+        ...prev,
+        lastStage: 'watchdog_recovered',
+      }));
+      setError('Watchdog: scanner cycle stalled and was recovered.');
+    }, PROCESS_TIMEOUT_MS + 2500);
     const startedAt = Date.now();
     let capturedUri = '';
 
     try {
+      console.log(`[scan] cycle=${cycleId} stage=capturing:start`);
       setHintText(usingHybrid ? 'Recognizing (Hybrid Hash)...' : 'Recognizing...');
-      capturedUri = usingHybrid ? await captureHybridUri() : await captureLegacyUri();
-      if (!capturedUri) return;
+      setDebugOverlay((prev) => ({ ...prev, lastStage: 'capturing' }));
+      capturedUri = usingHybrid
+        ? await withTimeout(captureHybridUri(), CAPTURE_TIMEOUT_MS, 'hybrid_capture')
+        : await withTimeout(captureLegacyUri(), CAPTURE_TIMEOUT_MS, 'legacy_capture');
+      console.log(`[scan] cycle=${cycleId} stage=capturing:done uri=${capturedUri ? 'ok' : 'empty'}`);
+      if (!capturedUri) {
+        setDebugOverlay((prev) => ({ ...prev, lastStage: 'capture_empty' }));
+        return;
+      }
 
       const shouldAllowOcrFallback = !usingHybrid || missStreakRef.current >= 1;
 
-      const result = await processFrameAndResolveCard({
-        imageUri: capturedUri,
-        cardFrame: CARD_FRAME,
-        editionFrameInCard: EDITION_FRAME,
-        fullCardFrameInCard: FULL_CARD_HASH_FRAME,
-        enableMultilingualFallback: scanSettings.multilingualFallback,
-        allowOcrFallback: shouldAllowOcrFallback,
-        skipEditionOcrInPrimary: usingHybrid,
-      });
+      setDebugOverlay((prev) => ({ ...prev, lastStage: 'processing' }));
+      console.log(
+        `[scan] cycle=${cycleId} stage=processing:start synthetic=${
+          syntheticFrameOnceRef.current ? '1' : '0'
+        }`
+      );
+      const result = await withTimeout(
+        processFrameAndResolveCard({
+          imageUri: capturedUri,
+          cardFrame: CARD_FRAME,
+          editionFrameInCard: EDITION_FRAME,
+          fullCardFrameInCard: FULL_CARD_HASH_FRAME,
+          enableMultilingualFallback: scanSettings.multilingualFallback,
+          allowOcrFallback: shouldAllowOcrFallback,
+          skipEditionOcrInPrimary: usingHybrid,
+          useSyntheticPixels: syntheticFrameOnceRef.current,
+        }),
+        PROCESS_TIMEOUT_MS,
+        'process_frame'
+      );
+      syntheticFrameOnceRef.current = false;
+      console.log(`[scan] cycle=${cycleId} stage=processing:done status=${result?.status ?? 'unknown'}`);
       const cycleDebug = result?.debug || result?.evidence?.debug || null;
+      setDebugOverlay((prev) => ({ ...prev, lastStage: `processed:${result?.status ?? 'unknown'}` }));
       if (cycleDebug) {
         setDebugOverlay({
           phashHi: String(cycleDebug.phash_hi ?? '-'),
@@ -375,6 +460,10 @@ export default function ScanScreen() {
           hashPreviewUri: cycleDebug.hashPreviewBase64
             ? `data:image/jpeg;base64,${cycleDebug.hashPreviewBase64}`
             : '',
+          cycleId: String(cycleId),
+          lastStage: `processed:${result?.status ?? 'unknown'}`,
+          lastDurationMs: String(Date.now() - cycleStartedAt),
+          lastError: '-',
         });
       } else {
         setDebugOverlay((prev) => ({
@@ -383,6 +472,9 @@ export default function ScanScreen() {
           minHamming: '-',
           minHamSwap: '-',
           hashPreviewUri: '',
+          cycleId: String(cycleId),
+          lastDurationMs: String(Date.now() - cycleStartedAt),
+          lastError: '-',
         }));
       }
 
@@ -458,9 +550,22 @@ export default function ScanScreen() {
         );
       }
       if (error) setError('');
-    } catch {
-      setError('Errore durante la scansione locale. Riprova.');
+    } catch (scanError) {
+      const message = scanError instanceof Error ? scanError.message : '';
+      console.error(`[scan] cycle=${cycleId} stage=error message=${message || 'unknown'}`);
+      setDebugOverlay((prev) => ({
+        ...prev,
+        lastStage: `error:${message || 'unknown'}`,
+        lastDurationMs: String(Date.now() - cycleStartedAt),
+        lastError: message || 'unknown',
+      }));
+      if (message.startsWith('timeout:')) {
+        setError('Scanner temporaneamente lento. Riprovo automaticamente.');
+      } else {
+        setError('Errore durante la scansione locale. Riprova.');
+      }
     } finally {
+      clearScanWatchdog();
       if (capturedUri) {
         await FileSystem.deleteAsync(capturedUri, { idempotent: true }).catch(() => {});
       }
@@ -477,6 +582,7 @@ export default function ScanScreen() {
     scanSettings.multilingualFallback,
     error,
     navigateToCard,
+    clearScanWatchdog,
   ]);
 
   useEffect(() => {
@@ -616,9 +722,11 @@ export default function ScanScreen() {
                 >
                   <Text style={{ color: '#d8dde5', fontSize: 14, textAlign: 'center' }}>{hintText}</Text>
                   <Text style={{ color: '#9aa4b2', fontSize: 11, textAlign: 'center' }}>
-                    {usingHybrid
-                      ? 'Fingerprint-first + OCR footer disambiguation'
-                      : 'OCR title first, edition only for ambiguous matches'}
+                    {catalogReady
+                      ? usingHybrid
+                        ? 'Fingerprint-first + OCR footer disambiguation'
+                        : 'OCR title first, edition only for ambiguous matches'
+                      : 'Preparing local catalog...'}
                   </Text>
                 </View>
 
@@ -657,6 +765,12 @@ export default function ScanScreen() {
                     <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
                       scan:{canScan ? '1' : '0'} focus:{isFocused ? '1' : '0'} busy:{busy ? '1' : '0'} modal:
                       {hasCandidates ? '1' : '0'}
+                    </Text>
+                    <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
+                      cycle:{debugOverlay.cycleId} stage:{debugOverlay.lastStage} dur:{debugOverlay.lastDurationMs}ms
+                    </Text>
+                    <Text style={{ color: '#ffb5b5', fontSize: 10 }}>
+                      err:{debugOverlay.lastError}
                     </Text>
                     <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
                       resize:{HASH_RESIZE_ALGO} gray:{HASH_GRAYSCALE_BIT_DEPTH}bit ar:

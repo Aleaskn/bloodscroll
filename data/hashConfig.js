@@ -4,3 +4,5 @@ export const HASH_D_WIDTH = 9;
 export const HASH_D_HEIGHT = 8;
 export const HASH_RESIZE_ALGO = 'nearest';
 export const HASH_GRAYSCALE_BIT_DEPTH = 8;
+export const HASH_ENABLE_HIST_EQUALIZATION = true;
+export const HASH_DEBUG_FORCE_FIXED = false;

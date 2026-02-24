@@ -157,6 +157,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
   const enableMultilingualFallback = !!frameMeta.enableMultilingualFallback;
   const allowOcrFallback = !!frameMeta.allowOcrFallback;
   const skipEditionOcrInPrimary = !!frameMeta.skipEditionOcrInPrimary;
+  const useSyntheticPixels = !!frameMeta.useSyntheticPixels;
 
   if (!imageUri) return { status: 'none', reason: 'missing_image_uri' };
 
@@ -187,16 +188,18 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
   // 2) Fingerprint-first resolution.
   let fingerprintAmbiguous = null;
   let bestFingerprintNoneDebug = null;
-  const fingerprintCandidates = await createImageFingerprintCandidates(imageUri, {
-    cardFrame,
-    regionMode: 'full_card',
-    regionFrameInCard: frameMeta.fullCardFrameInCard,
-    maxVariants: 5,
-    includeDebugPreview: true,
-  });
-
-  if (Array.isArray(fingerprintCandidates) && fingerprintCandidates.length) {
-    let bestMatched = null;
+  let bestMatched = null;
+  const runFingerprintPass = async (maxVariants) => {
+    const fingerprintCandidates = await createImageFingerprintCandidates(imageUri, {
+      cardFrame,
+      regionMode: 'full_card',
+      regionFrameInCard: frameMeta.fullCardFrameInCard,
+      maxVariants,
+      includeDebugPreview: true,
+      previewOnlyFirstVariant: true,
+      useSyntheticPixels,
+    });
+    if (!Array.isArray(fingerprintCandidates) || !fingerprintCandidates.length) return;
     for (const fingerprint of fingerprintCandidates) {
       const fingerprintResult = await resolveByFingerprint({
         ...fingerprint,
@@ -217,10 +220,12 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
           debug: {
             ...(fingerprintResult.debug || {}),
             variant: fingerprint.variant ?? null,
+            blurVariance: fingerprint.blurVariance ?? null,
+            quadConfidence: fingerprint.quadConfidence ?? null,
             hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
           },
         };
-        if (!bestMatched || Number(withDebug.confidence ?? 0) > Number(bestMatched.confidence ?? 0)) {
+        if (!bestMatched || Number(withDebug.confidence ?? 0) > Number(bestMatched?.confidence ?? 0)) {
           bestMatched = withDebug;
         }
         continue;
@@ -237,7 +242,7 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
           editionText
         );
         if (editionResolved) {
-          return {
+          bestMatched = {
             status: 'matched',
             cardId: String(editionResolved.id),
             matchedBy: 'fingerprint_ambiguous_resolved_by_edition',
@@ -252,9 +257,12 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
             debug: {
               ...(fingerprintResult.debug || {}),
               variant: fingerprint.variant ?? null,
+              blurVariance: fingerprint.blurVariance ?? null,
+              quadConfidence: fingerprint.quadConfidence ?? null,
               hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
             },
           };
+          continue;
         }
 
         const candidateAmbiguous = {
@@ -268,6 +276,8 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
           debug: {
             ...(fingerprintResult.debug || {}),
             variant: fingerprint.variant ?? null,
+            blurVariance: fingerprint.blurVariance ?? null,
+            quadConfidence: fingerprint.quadConfidence ?? null,
             hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
           },
         };
@@ -287,6 +297,8 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
         const candidateNoneDebug = {
           ...(fingerprintResult.debug || {}),
           variant: fingerprint.variant ?? null,
+          blurVariance: fingerprint.blurVariance ?? null,
+          quadConfidence: fingerprint.quadConfidence ?? null,
           hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
         };
         if (!bestFingerprintNoneDebug) {
@@ -300,10 +312,17 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
         }
       }
     }
+  };
 
-    if (bestMatched) return bestMatched;
-    if (fingerprintAmbiguous && !allowOcrFallback) return fingerprintAmbiguous;
+  // Fast-path for performance: one variant only.
+  await runFingerprintPass(1);
+  // Fallback expansion only when needed.
+  if (!bestMatched && !fingerprintAmbiguous) {
+    await runFingerprintPass(5);
   }
+
+  if (bestMatched) return bestMatched;
+  if (fingerprintAmbiguous && !allowOcrFallback) return fingerprintAmbiguous;
 
   if (!allowOcrFallback) {
     return {

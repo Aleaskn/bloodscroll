@@ -1,3 +1,5 @@
+import { HASH_ENABLE_HIST_EQUALIZATION } from './hashConfig';
+
 function clampByte(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 0;
@@ -104,12 +106,21 @@ export function equalizeGrayscaleHistogram(gray) {
 
 export function preprocessGrayscaleForHash(gray) {
   if (!gray || !gray.length) return new Uint8Array(0);
-  const contrast = normalizeGrayscaleContrast(gray, {
-    lowPercentile: 0.02,
-    highPercentile: 0.98,
-    gamma: 1,
-  });
-  return equalizeGrayscaleHistogram(contrast);
+  let min = 255;
+  let max = 0;
+  for (let i = 0; i < gray.length; i += 1) {
+    const v = gray[i];
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  if (max <= min) return new Uint8Array(gray);
+  const range = max - min;
+  const stretched = new Uint8Array(gray.length);
+  for (let i = 0; i < gray.length; i += 1) {
+    stretched[i] = clampByte(((gray[i] - min) * 255) / range);
+  }
+  if (!HASH_ENABLE_HIST_EQUALIZATION) return stretched;
+  return equalizeGrayscaleHistogram(stretched);
 }
 
 export function resizeGrayscaleNearest(gray, srcWidth, srcHeight, dstWidth, dstHeight) {
