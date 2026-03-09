@@ -6,7 +6,8 @@ import {
 } from 'expo-sqlite';
 
 const CATALOG_DB_NAME = 'cards-catalog.db';
-const CATALOG_ASSET_ID = require('../assets/catalog/cards-catalog.db');
+const CATALOG_ASSET_RELATIVE_PATH = '../assets/catalog/cards-catalog.db';
+const CATALOG_ASSET_ID = require(CATALOG_ASSET_RELATIVE_PATH);
 
 const META_KEYS = {
   version: 'catalog_version',
@@ -314,6 +315,44 @@ export async function getFingerprintStats() {
     total: Number(row?.total ?? 0) || 0,
     uniqueCards: Number(row?.unique_cards ?? 0) || 0,
   };
+}
+
+export async function loadFingerprintRowsForWarmup({ chunkSize = 6000 } = {}) {
+  const db = await getCatalogDb();
+  const size = Math.max(500, Math.min(30000, Number(chunkSize) || 6000));
+  const rows = [];
+  let lastRowId = 0;
+
+  while (true) {
+    const chunk = await db.getAllAsync(
+      `SELECT
+         f.rowid AS rowid,
+         f.card_id,
+         c.name,
+         f.set_code,
+         f.collector_number,
+         f.lang,
+         f.art_variant,
+         f.phash_hi,
+         f.phash_lo,
+         f.dhash_hi,
+         f.dhash_lo,
+         f.bucket16
+       FROM catalog_card_fingerprint f
+       JOIN catalog_cards c ON c.id = f.card_id
+       WHERE f.rowid > ?
+       ORDER BY f.rowid ASC
+       LIMIT ?;`,
+      [lastRowId, size]
+    );
+    if (!chunk?.length) break;
+    rows.push(...chunk);
+    const nextLast = Number(chunk[chunk.length - 1]?.rowid ?? 0);
+    if (!Number.isFinite(nextLast) || nextLast <= lastRowId) break;
+    lastRowId = nextLast;
+  }
+
+  return rows;
 }
 
 export async function searchByNameNormalized(

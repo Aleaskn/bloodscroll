@@ -1,5 +1,7 @@
-import { hammingDistance64BigInt, hiLoToHex64 } from './fingerprintCore.mjs';
+import { hammingDistance64, hiLoToHex64 } from './fingerprintCore.mjs';
 import { buildSetCollectorCandidates } from './catalogResolverCore.mjs';
+
+const YIELD_EVERY_ROWS = 16;
 
 function normalizeCollectorNumber(value) {
   const raw = String(value ?? '')
@@ -168,53 +170,57 @@ export async function resolveByFingerprintWithRepository(
     };
   }
 
-  const scoredAll = shortlist
-    .map((row) => {
-      const rawPhashHi = Number(row.phash_hi);
-      const rawPhashLo = Number(row.phash_lo);
-      const rawDhashHi = Number(row.dhash_hi);
-      const rawDhashLo = Number(row.dhash_lo);
-      if (
-        [rawPhashHi, rawPhashLo, rawDhashHi, rawDhashLo].some(
-          (value) => !Number.isFinite(value)
-        )
-      ) {
-        return null;
-      }
-      const rowPhashHi = toUInt32(rawPhashHi);
-      const rowPhashLo = toUInt32(rawPhashLo);
-      const rowDhashHi = toUInt32(rawDhashHi);
-      const rowDhashLo = toUInt32(rawDhashLo);
+  const scoredAll = [];
+  for (let i = 0; i < shortlist.length; i += 1) {
+    if (i > 0 && (i % YIELD_EVERY_ROWS) === 0) {
+      // Cooperative yield to keep UI updates responsive while scoring.
+      await Promise.resolve();
+    }
+    const row = shortlist[i];
+    const rawPhashHi = Number(row.phash_hi);
+    const rawPhashLo = Number(row.phash_lo);
+    const rawDhashHi = Number(row.dhash_hi);
+    const rawDhashLo = Number(row.dhash_lo);
+    if (
+      [rawPhashHi, rawPhashLo, rawDhashHi, rawDhashLo].some(
+        (value) => !Number.isFinite(value)
+      )
+    ) {
+      continue;
+    }
+    const rowPhashHi = toUInt32(rawPhashHi);
+    const rowPhashLo = toUInt32(rawPhashLo);
+    const rowDhashHi = toUInt32(rawDhashHi);
+    const rowDhashLo = toUInt32(rawDhashLo);
 
-      const phashDistance = hammingDistance64BigInt(inputPhashHi, inputPhashLo, rowPhashHi, rowPhashLo);
-      const dhashDistance = hammingDistance64BigInt(inputDhashHi, inputDhashLo, rowDhashHi, rowDhashLo);
-      const phashDistanceSwapHiLo = hammingDistance64BigInt(
-        inputPhashLo,
-        inputPhashHi,
-        rowPhashHi,
-        rowPhashLo
-      );
-      const dhashDistanceSwapHiLo = hammingDistance64BigInt(
-        inputDhashLo,
-        inputDhashHi,
-        rowDhashHi,
-        rowDhashLo
-      );
-      return {
-        ...row,
-        phash_hi: rowPhashHi,
-        phash_lo: rowPhashLo,
-        dhash_hi: rowDhashHi,
-        dhash_lo: rowDhashLo,
-        phashDistance,
-        dhashDistance,
-        phashDistanceSwapHiLo,
-        dhashDistanceSwapHiLo,
-        score: phashDistance + dhashDistance,
-        scoreSwapHiLo: phashDistanceSwapHiLo + dhashDistanceSwapHiLo,
-      };
-    })
-    .filter(Boolean);
+    const phashDistance = hammingDistance64(inputPhashHi, inputPhashLo, rowPhashHi, rowPhashLo);
+    const dhashDistance = hammingDistance64(inputDhashHi, inputDhashLo, rowDhashHi, rowDhashLo);
+    const phashDistanceSwapHiLo = hammingDistance64(
+      inputPhashLo,
+      inputPhashHi,
+      rowPhashHi,
+      rowPhashLo
+    );
+    const dhashDistanceSwapHiLo = hammingDistance64(
+      inputDhashLo,
+      inputDhashHi,
+      rowDhashHi,
+      rowDhashLo
+    );
+    scoredAll.push({
+      ...row,
+      phash_hi: rowPhashHi,
+      phash_lo: rowPhashLo,
+      dhash_hi: rowDhashHi,
+      dhash_lo: rowDhashLo,
+      phashDistance,
+      dhashDistance,
+      phashDistanceSwapHiLo,
+      dhashDistanceSwapHiLo,
+      score: phashDistance + dhashDistance,
+      scoreSwapHiLo: phashDistanceSwapHiLo + dhashDistanceSwapHiLo,
+    });
+  }
 
   const minHammingDistance =
     scoredAll.length > 0

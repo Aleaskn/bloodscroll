@@ -6,37 +6,94 @@ import { useRouter } from 'expo-router';
 import { useFocusEffect, useIsFocused } from '@react-navigation/native';
 import * as FileSystem from 'expo-file-system/legacy';
 import { ensureCatalogReady } from '../data/catalogDb';
-import { processFrameAndResolveCard } from '../data/scanEngine';
-import { isOnDeviceOcrAvailable } from '../data/ocrOnDevice';
+import { analyzeFrameForQuadTracking, processFrameAndResolveCard } from '../data/scanEngine';
+import { warmFingerprintResolverCache } from '../data/fingerprintResolver';
 import { recordScanMetric } from '../data/scanMetrics';
-import { getScanSettings, SCANNER_ENGINES } from '../data/scanSettings';
+import { SCANNER_ENGINES } from '../data/scanSettings';
 import { HASH_GRAYSCALE_BIT_DEPTH, HASH_RESIZE_ALGO, MTG_CARD_ASPECT_RATIO } from '../data/hashConfig';
 
-const LEGACY_SCAN_INTERVAL_MS = 1200;
-const HYBRID_SCAN_INTERVAL_MS = 260;
+const HYBRID_SCAN_INTERVAL_MS = 90;
 const NOT_FOUND_HINT_DELAY_MS = 9000;
+const QUAD_CONFIDENCE_GATE = 0.35;
+const QUAD_STABLE_FRAMES_REQUIRED = 2;
+const TRACK_PROCESS_TIMEOUT_MS = 5000;
+const HASH_PROCESS_TIMEOUT_MS = 3000;
+const HASH_COOLDOWN_MS = 180;
+const MIN_HAM_HARD_MATCH = 15;
+const MIN_HAM_SOFT_LOCK_MIN = 16;
+const MIN_HAM_SOFT_LOCK_MAX = 22;
+const MIN_HAM_SOFT_LOCK_MS = 500;
+const FINGERPRINT_MATCH_THRESHOLD = 0.88;
+const FINGERPRINT_STABLE_FRAMES = 1;
+const CAPTURE_TIMEOUT_MS = 5000;
+const PROCESS_TIMEOUT_MS = TRACK_PROCESS_TIMEOUT_MS + HASH_PROCESS_TIMEOUT_MS + 650;
+const MAX_QUAD_SHIFT_PX_FOR_HASH = 15;
 const CARD_FRAME = {
   left: 0.18,
   top: 0.22,
   width: 0.64,
   aspectRatio: MTG_CARD_ASPECT_RATIO,
 };
-const EDITION_FRAME = {
-  leftInCard: 0.035,
-  topInCard: 0.91,
-  widthInCard: 0.5,
-  heightInCard: 0.065,
-};
+const CARD_FRAME_HEIGHT_RATIO = CARD_FRAME.width / CARD_FRAME.aspectRatio;
 const FULL_CARD_HASH_FRAME = {
   leftInCard: 0.02,
   topInCard: 0.02,
   widthInCard: 0.96,
   heightInCard: 0.96,
 };
-const DECISION_CONFIDENCE_THRESHOLD = 0.95;
-const DECISION_STABLE_FRAMES = 2;
-const CAPTURE_TIMEOUT_MS = 3500;
-const PROCESS_TIMEOUT_MS = 7000;
+
+type QuadPointNorm = { x: number; y: number };
+type QuadBBoxNorm = { left: number; top: number; width: number; height: number };
+type OverlaySize = { width: number; height: number };
+type CapturedFrame = { uri: string; width: number; height: number; base64: string };
+
+type DebugOverlayState = {
+  phashHi: string;
+  phashLo: string;
+  dhashHi: string;
+  dhashLo: string;
+  bucket16: string;
+  rawHits: string;
+  minHamming: string;
+  minHamSwap: string;
+  hashPreviewUri: string;
+  cycleId: string;
+  lastStage: string;
+  lastDurationMs: string;
+  lastError: string;
+  blurVariance: string;
+  quadConfidence: string;
+  quadDetected: string;
+  quadGate: string;
+  quadPointsCardNorm: QuadPointNorm[] | null;
+  edgePointsCardNorm: QuadPointNorm[] | null;
+  quadBBoxCardNorm: QuadBBoxNorm | null;
+};
+
+function createInitialDebugOverlay(): DebugOverlayState {
+  return {
+    phashHi: '-',
+    phashLo: '-',
+    dhashHi: '-',
+    dhashLo: '-',
+    bucket16: '-',
+    rawHits: '-',
+    minHamming: '-',
+    minHamSwap: '-',
+    hashPreviewUri: '',
+    cycleId: '0',
+    lastStage: '-',
+    lastDurationMs: '-',
+    lastError: '-',
+    blurVariance: '-',
+    quadConfidence: '-',
+    quadDetected: '0',
+    quadGate: String(QUAD_CONFIDENCE_GATE),
+    quadPointsCardNorm: null,
+    edgePointsCardNorm: null,
+    quadBBoxCardNorm: null,
+  };
+}
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -80,16 +137,127 @@ function isVisionCameraPermissionGranted(status: string) {
   return normalized === 'granted' || normalized === 'authorized';
 }
 
+function clamp01(value: number) {
+  if (!Number.isFinite(Number(value))) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+function parseQuadPoints(value: any): QuadPointNorm[] | null {
+  if (!Array.isArray(value) || value.length !== 4) return null;
+  const parsed = value
+    .map((entry) => ({
+      x: clamp01(Number(entry?.x ?? 0)),
+      y: clamp01(Number(entry?.y ?? 0)),
+    }))
+    .filter((entry) => Number.isFinite(entry.x) && Number.isFinite(entry.y));
+  return parsed.length === 4 ? parsed : null;
+}
+
+function parseEdgePoints(value: any, maxPoints = 220): QuadPointNorm[] | null {
+  if (!Array.isArray(value) || !value.length) return null;
+  const parsed = value
+    .map((entry) => ({
+      x: clamp01(Number(entry?.x ?? 0)),
+      y: clamp01(Number(entry?.y ?? 0)),
+    }))
+    .filter((entry) => Number.isFinite(entry.x) && Number.isFinite(entry.y));
+  if (!parsed.length) return null;
+  if (parsed.length <= maxPoints) return parsed;
+  const step = Math.max(1, Math.ceil(parsed.length / maxPoints));
+  const sampled = [];
+  for (let i = 0; i < parsed.length; i += step) {
+    sampled.push(parsed[i]);
+    if (sampled.length >= maxPoints) break;
+  }
+  return sampled;
+}
+
+function parseQuadBBox(value: any): QuadBBoxNorm | null {
+  if (!value || typeof value !== 'object') return null;
+  const left = clamp01(Number(value.left ?? 0));
+  const top = clamp01(Number(value.top ?? 0));
+  const width = clamp01(Number(value.width ?? 0));
+  const height = clamp01(Number(value.height ?? 0));
+  if (width <= 0 || height <= 0) return null;
+  return {
+    left,
+    top,
+    width,
+    height,
+  };
+}
+
+function mapCardPointToOverlay(point: QuadPointNorm, overlay: OverlaySize) {
+  const maxX = Math.max(1, overlay.width);
+  const maxY = Math.max(1, overlay.height);
+  const x = (CARD_FRAME.left + point.x * CARD_FRAME.width) * maxX;
+  const y = (CARD_FRAME.top + point.y * CARD_FRAME_HEIGHT_RATIO) * maxY;
+  return {
+    x: Math.max(0, Math.min(maxX, x)),
+    y: Math.max(0, Math.min(maxY, y)),
+  };
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function computeAverageQuadShiftPx(
+  prevPoints: QuadPointNorm[] | null,
+  nextPoints: QuadPointNorm[] | null,
+  overlay: OverlaySize
+) {
+  if (!prevPoints || !nextPoints || prevPoints.length !== 4 || nextPoints.length !== 4) return 0;
+  if (!overlay.width || !overlay.height) return 0;
+  let sum = 0;
+  for (let i = 0; i < 4; i += 1) {
+    const a = mapCardPointToOverlay(prevPoints[i], overlay);
+    const b = mapCardPointToOverlay(nextPoints[i], overlay);
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    sum += Math.sqrt(dx * dx + dy * dy);
+  }
+  return sum / 4;
+}
+
+function pickLeanScanFormat(visionModule: any, device: any) {
+  if (!visionModule || !device?.formats?.length) return null;
+  if (typeof visionModule.getCameraFormat === 'function') {
+    try {
+      return visionModule.getCameraFormat(device, [
+        { videoResolution: { width: 1280, height: 720 } },
+        { photoResolution: { width: 1280, height: 720 } },
+        { fps: 30 },
+      ]);
+    } catch {
+      // fallback below
+    }
+  }
+
+  const formats = Array.isArray(device.formats) ? device.formats : [];
+  const candidates = formats
+    .filter((format) => {
+      const videoPixels = Number(format?.videoWidth ?? 0) * Number(format?.videoHeight ?? 0);
+      const photoPixels = Number(format?.photoWidth ?? 0) * Number(format?.photoHeight ?? 0);
+      return videoPixels > 0 && photoPixels > 0 && videoPixels <= (1280 * 720) && photoPixels <= (1280 * 720);
+    })
+    .sort((a, b) => {
+      const aVideo = Number(a?.videoWidth ?? 0) * Number(a?.videoHeight ?? 0);
+      const bVideo = Number(b?.videoWidth ?? 0) * Number(b?.videoHeight ?? 0);
+      return bVideo - aVideo;
+    });
+  return candidates[0] ?? formats[0] ?? null;
+}
+
 export default function ScanScreen() {
   const router = useRouter();
   const isFocused = useIsFocused();
-  const [scanSettings, setScanSettings] = useState({
-    engine: SCANNER_ENGINES.HYBRID_HASH_BETA,
-    multilingualFallback: false,
-  });
-  const [cameraModule, setCameraModule] = useState<any>(null);
   const [visionCameraModule, setVisionCameraModule] = useState<any>(null);
   const [visionDevice, setVisionDevice] = useState<any>(null);
+  const [visionFormat, setVisionFormat] = useState<any>(null);
   const [cameraInstallError, setCameraInstallError] = useState('');
   const [permission, setPermission] = useState<'loading' | 'granted' | 'denied'>('loading');
   const [cameraReady, setCameraReady] = useState(false);
@@ -97,42 +265,30 @@ export default function ScanScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [hintText, setHintText] = useState('Loading scanner...');
-  const [debugOverlay, setDebugOverlay] = useState({
-    phashHi: '-',
-    phashLo: '-',
-    dhashHi: '-',
-    dhashLo: '-',
-    bucket16: '-',
-    rawHits: '-',
-    minHamming: '-',
-    minHamSwap: '-',
-    hashPreviewUri: '',
-    cycleId: '0',
-    lastStage: '-',
-    lastDurationMs: '-',
-    lastError: '-',
-  });
+  const [debugOverlay, setDebugOverlay] = useState<DebugOverlayState>(createInitialDebugOverlay());
   const [candidates, setCandidates] = useState<any[]>([]);
-  const CameraView = cameraModule?.CameraView;
+  const [overlaySize, setOverlaySize] = useState<OverlaySize>({ width: 0, height: 0 });
+  const debugMode = __DEV__;
+
   const VisionCamera = visionCameraModule?.Camera;
-  const legacyCameraRef = useRef<any>(null);
   const hybridCameraRef = useRef<any>(null);
   const scanningTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const navigatedRef = useRef(false);
   const pausedRef = useRef(false);
   const hasCandidatesRef = useRef(false);
   const firstMissAtRef = useRef<number | null>(null);
-  const missStreakRef = useRef(0);
   const scanInFlightRef = useRef(false);
   const scanCycleIdRef = useRef(0);
   const scanWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const syntheticFrameOnceRef = useRef(true);
   const stableMatchRef = useRef<{ cardId: string; count: number }>({ cardId: '', count: 0 });
+  const stableQuadFramesRef = useRef(0);
+  const hashCooldownUntilRef = useRef(0);
+  const softHamLockRef = useRef<{ startedAt: number; cardId: string; bestMinHam: number } | null>(null);
+  const previousReadyQuadRef = useRef<QuadPointNorm[] | null>(null);
 
-  const usingHybrid = scanSettings.engine === SCANNER_ENGINES.HYBRID_HASH_BETA;
   const hasCandidates = candidates.length > 0;
   const canScan = useMemo(() => {
-    const cameraAvailable = usingHybrid ? !!VisionCamera && !!visionDevice : !!CameraView;
+    const cameraAvailable = !!VisionCamera && !!visionDevice;
     return (
       isFocused &&
       cameraAvailable &&
@@ -142,18 +298,7 @@ export default function ScanScreen() {
       !hasCandidates &&
       !busy
     );
-  }, [
-    isFocused,
-    usingHybrid,
-    VisionCamera,
-    visionDevice,
-    CameraView,
-    catalogReady,
-    cameraReady,
-    permission,
-    hasCandidates,
-    busy,
-  ]);
+  }, [isFocused, VisionCamera, visionDevice, catalogReady, cameraReady, permission, hasCandidates, busy]);
 
   const clearScanningTimer = useCallback(() => {
     if (!scanningTimeoutRef.current) return;
@@ -166,6 +311,15 @@ export default function ScanScreen() {
     clearTimeout(scanWatchdogRef.current);
     scanWatchdogRef.current = null;
   }, []);
+
+  const frameProcessorAvailable = useMemo(() => {
+    const proxy = visionCameraModule?.VisionCameraProxy;
+    if (!proxy) return false;
+    return (
+      typeof proxy.setFrameProcessor === 'function' ||
+      typeof proxy.initFrameProcessorPlugin === 'function'
+    );
+  }, [visionCameraModule]);
 
   useEffect(() => {
     hasCandidatesRef.current = hasCandidates;
@@ -182,26 +336,19 @@ export default function ScanScreen() {
     }
   }, [isFocused, hasCandidates, clearScanningTimer]);
 
-  const refreshScanSettings = useCallback(async () => {
-    const next = await getScanSettings();
-    setScanSettings(next);
-  }, []);
-
   useEffect(() => {
     let mounted = true;
 
     const setupCore = async () => {
       try {
         setHintText('Loading scanner...');
-        await refreshScanSettings();
-
-        // OCR availability is optional in Hybrid mode during bootstrap.
-        const ocrReady = await isOnDeviceOcrAvailable();
-        if (!ocrReady && !usingHybrid) {
-          throw new Error('OCR on-device non disponibile. Verifica la build di sviluppo.');
-        }
-
         await ensureCatalogReady();
+        setHintText('Warming fingerprint cache...');
+        try {
+          await withTimeout(warmFingerprintResolverCache({ chunkSize: 8000 }), 20000, 'warm_fingerprint_cache');
+        } catch {
+          // Non-blocking fallback: resolver will use sqlite path.
+        }
         if (!mounted) return;
         setCatalogReady(true);
         setHintText('Point your camera at a card');
@@ -209,11 +356,7 @@ export default function ScanScreen() {
         if (!mounted) return;
         setCatalogReady(false);
         setHintText('Scanner init failed. Check catalog and retry.');
-        setError(
-          setupError instanceof Error
-            ? setupError.message
-            : 'Errore inizializzazione scanner.'
-        );
+        setError(setupError instanceof Error ? setupError.message : 'Errore inizializzazione scanner.');
       }
     };
 
@@ -221,33 +364,13 @@ export default function ScanScreen() {
     return () => {
       mounted = false;
     };
-  }, [refreshScanSettings, usingHybrid]);
+  }, []);
 
   useEffect(() => {
     let mounted = true;
     setCameraReady(false);
     setPermission('loading');
     setCameraInstallError('');
-
-    const setupLegacyCamera = async () => {
-      try {
-        const mod = await import('expo-camera');
-        if (!mounted) return;
-        setCameraModule(mod);
-        const current = await mod.Camera.getCameraPermissionsAsync();
-        if (current.granted) {
-          setPermission('granted');
-        } else {
-          const requested = await mod.Camera.requestCameraPermissionsAsync();
-          setPermission(requested.granted ? 'granted' : 'denied');
-        }
-      } catch {
-        if (!mounted) return;
-        setCameraModule(null);
-        setPermission('denied');
-        setCameraInstallError('Scanner legacy non disponibile. Installa expo-camera.');
-      }
-    };
 
     const setupHybridCamera = async () => {
       try {
@@ -265,64 +388,49 @@ export default function ScanScreen() {
         const devices = mod.Camera.getAvailableCameraDevices?.() ?? [];
         const back = devices.find((device: any) => device?.position === 'back') ?? null;
         setVisionDevice(back);
+        setVisionFormat(pickLeanScanFormat(mod, back));
       } catch {
         if (!mounted) return;
         setVisionCameraModule(null);
         setVisionDevice(null);
+        setVisionFormat(null);
         setPermission('denied');
-        setCameraInstallError('Scanner hash beta non disponibile. Installa react-native-vision-camera.');
+        setCameraInstallError('Scanner hash non disponibile. Installa react-native-vision-camera.');
       }
     };
 
-    if (usingHybrid) {
-      void setupHybridCamera();
-    } else {
-      void setupLegacyCamera();
-    }
+    void setupHybridCamera();
 
     return () => {
       mounted = false;
     };
-  }, [usingHybrid]);
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
-      void refreshScanSettings();
       navigatedRef.current = false;
       pausedRef.current = false;
       firstMissAtRef.current = null;
-      missStreakRef.current = 0;
       stableMatchRef.current = { cardId: '', count: 0 };
+      stableQuadFramesRef.current = 0;
+      hashCooldownUntilRef.current = 0;
+      softHamLockRef.current = null;
+      previousReadyQuadRef.current = null;
       setCandidates([]);
       setError('');
-      setDebugOverlay({
-        phashHi: '-',
-        phashLo: '-',
-        dhashHi: '-',
-        dhashLo: '-',
-        bucket16: '-',
-        rawHits: '-',
-        minHamming: '-',
-        minHamSwap: '-',
-        hashPreviewUri: '',
-        cycleId: '0',
-        lastStage: '-',
-        lastDurationMs: '-',
-        lastError: '-',
-      });
+      setDebugOverlay(createInitialDebugOverlay());
       if (catalogReady) setHintText('Point your camera at a card');
       return () => {
         clearScanningTimer();
         clearScanWatchdog();
       };
-    }, [catalogReady, clearScanningTimer, clearScanWatchdog, refreshScanSettings])
+    }, [catalogReady, clearScanningTimer, clearScanWatchdog])
   );
 
   const navigateToCard = useCallback(
     (cardId: string) => {
       clearScanningTimer();
       pausedRef.current = true;
-      missStreakRef.current = 0;
       setCandidates([]);
       setError('');
       setHintText('Matched');
@@ -338,21 +446,37 @@ export default function ScanScreen() {
     [clearScanningTimer, router]
   );
 
-  const captureLegacyUri = useCallback(async () => {
-    if (!legacyCameraRef.current) return '';
-    const photo = await legacyCameraRef.current.takePictureAsync({
-      quality: 0.45,
-      skipProcessing: false,
-      shutterSound: false,
-    });
-    return photo?.uri || '';
-  }, []);
-
-  const captureHybridUri = useCallback(async () => {
+  const captureHybridFrame = useCallback(async (): Promise<CapturedFrame> => {
+    const empty: CapturedFrame = { uri: '', width: 0, height: 0, base64: '' };
     const camera = hybridCameraRef.current;
-    if (!camera) return '';
+    if (!camera) return empty;
 
-    // iOS is generally more stable with takePhoto in dev builds.
+    if (typeof camera.takeSnapshot === 'function') {
+      try {
+        const snapshot = await camera.takeSnapshot({
+          quality: 65,
+          skipMetadata: true,
+        });
+        const uri = await ensureExistingFileUri(snapshot?.path ?? snapshot?.uri ?? snapshot);
+        if (uri) {
+          let base64 = '';
+          try {
+            base64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+          } catch {
+            base64 = '';
+          }
+          return {
+            uri,
+            width: Number(snapshot?.width ?? 0),
+            height: Number(snapshot?.height ?? 0),
+            base64,
+          };
+        }
+      } catch {
+        // fallback below
+      }
+    }
+
     if (typeof camera.takePhoto === 'function') {
       try {
         const photo = await camera.takePhoto({
@@ -360,27 +484,21 @@ export default function ScanScreen() {
           enableShutterSound: false,
           skipMetadata: true,
         });
-        const fromPhoto = await ensureExistingFileUri(photo?.path ?? photo?.uri ?? photo);
-        if (fromPhoto) return fromPhoto;
-      } catch {
-        // fallback below
-      }
-    }
-
-    if (typeof camera.takeSnapshot === 'function') {
-      try {
-        const snapshot = await camera.takeSnapshot({
-          quality: 85,
-          skipMetadata: true,
-        });
-        const fromSnapshot = await ensureExistingFileUri(snapshot?.path ?? snapshot?.uri ?? snapshot);
-        if (fromSnapshot) return fromSnapshot;
+        const uri = await ensureExistingFileUri(photo?.path ?? photo?.uri ?? photo);
+        if (uri) {
+          return {
+            uri,
+            width: Number(photo?.width ?? 0),
+            height: Number(photo?.height ?? 0),
+            base64: '',
+          };
+        }
       } catch {
         // no-op
       }
     }
 
-    return '';
+    return empty;
   }, []);
 
   const runScanCycle = useCallback(async () => {
@@ -395,6 +513,7 @@ export default function ScanScreen() {
       lastStage: 'cycle_start',
       lastDurationMs: '-',
     }));
+
     clearScanWatchdog();
     scanWatchdogRef.current = setTimeout(() => {
       scanInFlightRef.current = false;
@@ -405,49 +524,140 @@ export default function ScanScreen() {
       }));
       setError('Watchdog: scanner cycle stalled and was recovered.');
     }, PROCESS_TIMEOUT_MS + 2500);
+
     const startedAt = Date.now();
-    let capturedUri = '';
+    let capturedFrame: CapturedFrame = { uri: '', width: 0, height: 0, base64: '' };
 
     try {
       console.log(`[scan] cycle=${cycleId} stage=capturing:start`);
-      setHintText(usingHybrid ? 'Recognizing (Hybrid Hash)...' : 'Recognizing...');
+      setHintText('Tracking card quad...');
       setDebugOverlay((prev) => ({ ...prev, lastStage: 'capturing' }));
-      capturedUri = usingHybrid
-        ? await withTimeout(captureHybridUri(), CAPTURE_TIMEOUT_MS, 'hybrid_capture')
-        : await withTimeout(captureLegacyUri(), CAPTURE_TIMEOUT_MS, 'legacy_capture');
-      console.log(`[scan] cycle=${cycleId} stage=capturing:done uri=${capturedUri ? 'ok' : 'empty'}`);
-      if (!capturedUri) {
+      capturedFrame = await withTimeout(captureHybridFrame(), CAPTURE_TIMEOUT_MS, 'hybrid_capture');
+      console.log(`[scan] cycle=${cycleId} stage=capturing:done uri=${capturedFrame.uri ? 'ok' : 'empty'}`);
+      if (!capturedFrame.uri) {
         setDebugOverlay((prev) => ({ ...prev, lastStage: 'capture_empty' }));
         return;
       }
 
-      const shouldAllowOcrFallback = !usingHybrid || missStreakRef.current >= 1;
-
-      setDebugOverlay((prev) => ({ ...prev, lastStage: 'processing' }));
-      console.log(
-        `[scan] cycle=${cycleId} stage=processing:start synthetic=${
-          syntheticFrameOnceRef.current ? '1' : '0'
-        }`
+      setDebugOverlay((prev) => ({ ...prev, lastStage: 'tracking' }));
+      const trackingResult = await withTimeout(
+        analyzeFrameForQuadTracking({
+          imageUri: capturedFrame.uri,
+          imageBase64: capturedFrame.base64,
+          imageWidth: capturedFrame.width,
+          imageHeight: capturedFrame.height,
+          cardFrame: CARD_FRAME,
+          fullCardFrameInCard: FULL_CARD_HASH_FRAME,
+        }),
+        TRACK_PROCESS_TIMEOUT_MS,
+        'track_frame'
       );
+      const trackingDebug = trackingResult?.debug || null;
+      let trackingQuadPoints: QuadPointNorm[] | null = null;
+      if (trackingDebug) {
+        const quadPoints = parseQuadPoints(trackingDebug.quadPointsCardNorm);
+        trackingQuadPoints = quadPoints;
+        const edgePoints = debugMode ? parseEdgePoints(trackingDebug.edgePointsCardNorm) : null;
+        const quadBBox = parseQuadBBox(trackingDebug.quadBBoxCardNorm);
+        setDebugOverlay({
+          phashHi: '-',
+          phashLo: '-',
+          dhashHi: '-',
+          dhashLo: '-',
+          bucket16: '-',
+          rawHits: '-',
+          minHamming: '-',
+          minHamSwap: '-',
+          hashPreviewUri: '',
+          cycleId: String(cycleId),
+          lastStage: `tracking:${trackingResult?.status ?? 'none'}`,
+          lastDurationMs: String(Date.now() - cycleStartedAt),
+          lastError: '-',
+          blurVariance: String(trackingDebug.blurVariance ?? '-'),
+          quadConfidence: String(trackingDebug.quadConfidence ?? '-'),
+          quadDetected: trackingDebug.quadDetected ? '1' : '0',
+          quadGate: String(trackingDebug.quadGate ?? QUAD_CONFIDENCE_GATE),
+          quadPointsCardNorm: quadPoints,
+          edgePointsCardNorm: edgePoints,
+          quadBBoxCardNorm: quadBBox,
+        });
+      }
+
+      if (trackingResult?.reason === 'blur_too_low') {
+        softHamLockRef.current = null;
+        stableQuadFramesRef.current = 0;
+        stableMatchRef.current = { cardId: '', count: 0 };
+        previousReadyQuadRef.current = null;
+        setHintText('Frame blurred. Hold steady');
+        setError((prev) => (prev ? '' : prev));
+        return;
+      }
+
+      if (trackingResult?.status !== 'ready') {
+        softHamLockRef.current = null;
+        stableQuadFramesRef.current = 0;
+        stableMatchRef.current = { cardId: '', count: 0 };
+        previousReadyQuadRef.current = null;
+        if (trackingResult?.reason === 'quad_confidence_low') {
+          setHintText('Tracking quad... center full card');
+        } else {
+          setHintText('Searching card edges...');
+        }
+        setError((prev) => (prev ? '' : prev));
+        return;
+      }
+
+      const quadShiftPx = computeAverageQuadShiftPx(
+        previousReadyQuadRef.current,
+        trackingQuadPoints,
+        overlaySize
+      );
+      if (quadShiftPx > MAX_QUAD_SHIFT_PX_FOR_HASH) {
+        previousReadyQuadRef.current = trackingQuadPoints;
+        stableQuadFramesRef.current = 0;
+        setHintText(`Quad moving (${quadShiftPx.toFixed(1)}px). Hold steady`);
+        setError((prev) => (prev ? '' : prev));
+        return;
+      }
+      if (trackingQuadPoints?.length === 4) {
+        previousReadyQuadRef.current = trackingQuadPoints;
+      }
+
+      stableQuadFramesRef.current += 1;
+      if (stableQuadFramesRef.current < QUAD_STABLE_FRAMES_REQUIRED) {
+        setHintText(`Quad stable ${stableQuadFramesRef.current}/${QUAD_STABLE_FRAMES_REQUIRED}`);
+        setError((prev) => (prev ? '' : prev));
+        return;
+      }
+
+      if (Date.now() < hashCooldownUntilRef.current) {
+        return;
+      }
+      hashCooldownUntilRef.current = Date.now() + HASH_COOLDOWN_MS;
+
+      setHintText('Recognizing (Fingerprint + Warp)...');
+      setDebugOverlay((prev) => ({ ...prev, lastStage: 'hashing' }));
       const result = await withTimeout(
         processFrameAndResolveCard({
-          imageUri: capturedUri,
+          imageUri: capturedFrame.uri,
           cardFrame: CARD_FRAME,
-          editionFrameInCard: EDITION_FRAME,
           fullCardFrameInCard: FULL_CARD_HASH_FRAME,
-          enableMultilingualFallback: scanSettings.multilingualFallback,
-          allowOcrFallback: shouldAllowOcrFallback,
-          skipEditionOcrInPrimary: usingHybrid,
-          useSyntheticPixels: syntheticFrameOnceRef.current,
+          maxVariantsPrimary: 1,
+          maxVariantsExtended: 2,
+          enableExtendedPass: false,
+          includeDebugPreview: false,
         }),
-        PROCESS_TIMEOUT_MS,
-        'process_frame'
+        HASH_PROCESS_TIMEOUT_MS,
+        'hash_frame'
       );
-      syntheticFrameOnceRef.current = false;
-      console.log(`[scan] cycle=${cycleId} stage=processing:done status=${result?.status ?? 'unknown'}`);
-      const cycleDebug = result?.debug || result?.evidence?.debug || null;
-      setDebugOverlay((prev) => ({ ...prev, lastStage: `processed:${result?.status ?? 'unknown'}` }));
+
+      const cycleDebug = result?.debug || null;
+      setDebugOverlay((prev) => ({ ...prev, lastStage: `hash:${result?.status ?? 'unknown'}` }));
+
       if (cycleDebug) {
+        const quadPoints = parseQuadPoints(cycleDebug.quadPointsCardNorm);
+        const edgePoints = debugMode ? parseEdgePoints(cycleDebug.edgePointsCardNorm) : null;
+        const quadBBox = parseQuadBBox(cycleDebug.quadBBoxCardNorm);
         setDebugOverlay({
           phashHi: String(cycleDebug.phash_hi ?? '-'),
           phashLo: String(cycleDebug.phash_lo ?? '-'),
@@ -457,44 +667,76 @@ export default function ScanScreen() {
           rawHits: String(cycleDebug.rawHitsCount ?? '-'),
           minHamming: String(cycleDebug.minHammingDistance ?? '-'),
           minHamSwap: String(cycleDebug.minHammingDistanceSwapHiLo ?? '-'),
-          hashPreviewUri: cycleDebug.hashPreviewBase64
-            ? `data:image/jpeg;base64,${cycleDebug.hashPreviewBase64}`
-            : '',
+          hashPreviewUri: cycleDebug.hashPreviewBase64 ? `data:image/jpeg;base64,${cycleDebug.hashPreviewBase64}` : '',
           cycleId: String(cycleId),
-          lastStage: `processed:${result?.status ?? 'unknown'}`,
+          lastStage: `hash:${result?.status ?? 'unknown'}`,
           lastDurationMs: String(Date.now() - cycleStartedAt),
           lastError: '-',
+          blurVariance: String(cycleDebug.blurVariance ?? '-'),
+          quadConfidence: String(cycleDebug.quadConfidence ?? '-'),
+          quadDetected: cycleDebug.quadDetected ? '1' : '0',
+          quadGate: String(cycleDebug.quadGate ?? QUAD_CONFIDENCE_GATE),
+          quadPointsCardNorm: quadPoints,
+          edgePointsCardNorm: edgePoints,
+          quadBBoxCardNorm: quadBBox,
         });
       } else {
         setDebugOverlay((prev) => ({
           ...prev,
-          rawHits: '-',
-          minHamming: '-',
-          minHamSwap: '-',
-          hashPreviewUri: '',
           cycleId: String(cycleId),
           lastDurationMs: String(Date.now() - cycleStartedAt),
           lastError: '-',
         }));
       }
 
+      const minHamValue = toFiniteNumber(cycleDebug?.minHammingDistance);
+      let softLockExpired = false;
+      if (
+        minHamValue != null &&
+        minHamValue >= MIN_HAM_SOFT_LOCK_MIN &&
+        minHamValue <= MIN_HAM_SOFT_LOCK_MAX
+      ) {
+        const now = Date.now();
+        const cardKey = String(result?.cardId ?? '');
+        const currentLock = softHamLockRef.current;
+        if (!currentLock || currentLock.cardId !== cardKey) {
+          softHamLockRef.current = {
+            startedAt: now,
+            cardId: cardKey,
+            bestMinHam: minHamValue,
+          };
+        } else {
+          currentLock.bestMinHam = Math.min(currentLock.bestMinHam, minHamValue);
+        }
+        const elapsedSoftLock = now - (softHamLockRef.current?.startedAt ?? now);
+        if (elapsedSoftLock < MIN_HAM_SOFT_LOCK_MS) {
+          setHintText(
+            `Soft-lock minHam ${minHamValue}. Cerco <= ${MIN_HAM_HARD_MATCH} (${MIN_HAM_SOFT_LOCK_MS - elapsedSoftLock}ms)`
+          );
+          setError((prev) => (prev ? '' : prev));
+          return;
+        }
+        softLockExpired = true;
+        softHamLockRef.current = null;
+      } else {
+        softHamLockRef.current = null;
+      }
+
       if (result.status === 'matched' && result.cardId) {
         const confidence = Number(result.confidence ?? 0);
-        const matchedBy = String(result.matchedBy ?? '');
-        const isFingerprintDriven =
-          matchedBy.startsWith('fingerprint') || matchedBy.includes('consensus');
-        const threshold = isFingerprintDriven ? 0.88 : DECISION_CONFIDENCE_THRESHOLD;
-        const requiredStableFrames = isFingerprintDriven ? 1 : DECISION_STABLE_FRAMES;
-        if (confidence >= threshold) {
+        const definitiveByHamming = minHamValue != null && minHamValue <= MIN_HAM_HARD_MATCH;
+        const definitiveByConfidenceFallback =
+          minHamValue == null && confidence >= FINGERPRINT_MATCH_THRESHOLD;
+        if (!softLockExpired && (definitiveByHamming || definitiveByConfidenceFallback)) {
           if (stableMatchRef.current.cardId === String(result.cardId)) {
             stableMatchRef.current.count += 1;
           } else {
             stableMatchRef.current = { cardId: String(result.cardId), count: 1 };
           }
-          if (stableMatchRef.current.count >= requiredStableFrames) {
-            missStreakRef.current = 0;
+
+          if (stableMatchRef.current.count >= FINGERPRINT_STABLE_FRAMES) {
             await recordScanMetric({
-              engine: scanSettings.engine,
+              engine: SCANNER_ENGINES.HYBRID_HASH_BETA,
               status: 'matched',
               matchedBy: result.matchedBy,
               confidence,
@@ -511,11 +753,10 @@ export default function ScanScreen() {
       }
 
       if (result.status === 'ambiguous' && Array.isArray(result.candidates) && result.candidates.length) {
-        missStreakRef.current = 0;
         pausedRef.current = true;
         clearScanningTimer();
         await recordScanMetric({
-          engine: scanSettings.engine,
+          engine: SCANNER_ENGINES.HYBRID_HASH_BETA,
           status: 'ambiguous',
           matchedBy: result.matchedBy,
           confidence: result.confidence,
@@ -527,29 +768,29 @@ export default function ScanScreen() {
       }
 
       await recordScanMetric({
-        engine: scanSettings.engine,
+        engine: SCANNER_ENGINES.HYBRID_HASH_BETA,
         status: 'none',
         matchedBy: result?.matchedBy ?? null,
         confidence: result?.confidence ?? null,
         latencyMs: Date.now() - startedAt,
       });
 
-      missStreakRef.current += 1;
-
       if (firstMissAtRef.current == null) {
         firstMissAtRef.current = Date.now();
       }
       const elapsed = Date.now() - firstMissAtRef.current;
-      if (elapsed >= NOT_FOUND_HINT_DELAY_MS) {
-        setHintText('No confident hash match yet. Hold steady on artwork');
+      if (result?.reason === 'quad_confidence_low') {
+        stableQuadFramesRef.current = 0;
+        setHintText('Quad low confidence. Keep full card in frame and hold steady');
+      } else if (softLockExpired) {
+        setHintText('Soft-lock scaduto: serve un frame piu pulito (minHam <= 15)');
+      } else if (elapsed >= NOT_FOUND_HINT_DELAY_MS) {
+        setHintText('No confident hash match yet. Hold steady on full card');
       } else {
-        setHintText(
-          shouldAllowOcrFallback
-            ? 'Hash miss: OCR fallback enabled'
-            : 'Hash-first scan active (OCR fallback delayed)'
-        );
+        setHintText('Fingerprint scan active');
       }
-      if (error) setError('');
+
+      setError((prev) => (prev ? '' : prev));
     } catch (scanError) {
       const message = scanError instanceof Error ? scanError.message : '';
       console.error(`[scan] cycle=${cycleId} stage=error message=${message || 'unknown'}`);
@@ -559,47 +800,103 @@ export default function ScanScreen() {
         lastDurationMs: String(Date.now() - cycleStartedAt),
         lastError: message || 'unknown',
       }));
-      if (message.startsWith('timeout:')) {
+      if (message === 'timeout:hash_frame') {
+        setHintText('Frame dropped (slow hash), continuing...');
+        setError((prev) => (prev ? '' : prev));
+      } else if (message.startsWith('timeout:')) {
         setError('Scanner temporaneamente lento. Riprovo automaticamente.');
       } else {
         setError('Errore durante la scansione locale. Riprova.');
       }
     } finally {
       clearScanWatchdog();
-      if (capturedUri) {
-        await FileSystem.deleteAsync(capturedUri, { idempotent: true }).catch(() => {});
+      if (capturedFrame.uri) {
+        await FileSystem.deleteAsync(capturedFrame.uri, { idempotent: true }).catch(() => {});
       }
       setBusy(false);
       scanInFlightRef.current = false;
     }
-  }, [
-    canScan,
-    clearScanningTimer,
-    usingHybrid,
-    captureHybridUri,
-    captureLegacyUri,
-    scanSettings.engine,
-    scanSettings.multilingualFallback,
-    error,
-    navigateToCard,
-    clearScanWatchdog,
-  ]);
+  }, [canScan, clearScanWatchdog, clearScanningTimer, captureHybridFrame, debugMode, navigateToCard, overlaySize]);
 
   useEffect(() => {
     clearScanningTimer();
     if (!canScan || pausedRef.current || navigatedRef.current) return undefined;
 
-    const interval = usingHybrid ? HYBRID_SCAN_INTERVAL_MS : LEGACY_SCAN_INTERVAL_MS;
     const loop = async () => {
       await runScanCycle();
       if (!pausedRef.current && !navigatedRef.current && !hasCandidatesRef.current) {
-        scanningTimeoutRef.current = setTimeout(loop, interval);
+        scanningTimeoutRef.current = setTimeout(loop, HYBRID_SCAN_INTERVAL_MS);
       }
     };
 
     scanningTimeoutRef.current = setTimeout(loop, 450);
     return clearScanningTimer;
-  }, [canScan, usingHybrid, runScanCycle, clearScanningTimer]);
+  }, [canScan, runScanCycle, clearScanningTimer]);
+
+  const mappedQuad = useMemo(() => {
+    const points = debugOverlay.quadPointsCardNorm;
+    const confidence = Number(debugOverlay.quadConfidence);
+    if (!points || points.length !== 4) return null;
+    if (!Number.isFinite(confidence) || confidence < QUAD_CONFIDENCE_GATE) return null;
+    if (!overlaySize.width || !overlaySize.height) return null;
+
+    const mappedPoints = points.map((point) => mapCardPointToOverlay(point, overlaySize));
+    const segments = mappedPoints.map((start, index) => {
+      const end = mappedPoints[(index + 1) % mappedPoints.length];
+      const dx = end.x - start.x;
+      const dy = end.y - start.y;
+      const length = Math.max(1, Math.sqrt(dx * dx + dy * dy));
+      const angle = Math.atan2(dy, dx);
+      return {
+        key: `seg-${index}`,
+        left: (start.x + end.x) / 2 - length / 2,
+        top: (start.y + end.y) / 2 - 1,
+        width: length,
+        angle,
+      };
+    });
+
+    let mappedBBox = null;
+    if (debugOverlay.quadBBoxCardNorm) {
+      const bbox = debugOverlay.quadBBoxCardNorm;
+      const topLeft = mapCardPointToOverlay({ x: bbox.left, y: bbox.top }, overlaySize);
+      const bottomRight = mapCardPointToOverlay(
+        {
+          x: clamp01(bbox.left + bbox.width),
+          y: clamp01(bbox.top + bbox.height),
+        },
+        overlaySize
+      );
+      mappedBBox = {
+        left: Math.min(topLeft.x, bottomRight.x),
+        top: Math.min(topLeft.y, bottomRight.y),
+        width: Math.abs(bottomRight.x - topLeft.x),
+        height: Math.abs(bottomRight.y - topLeft.y),
+      };
+    }
+
+    return {
+      points: mappedPoints,
+      segments,
+      bbox: mappedBBox,
+      confidence,
+    };
+  }, [debugOverlay.quadPointsCardNorm, debugOverlay.quadBBoxCardNorm, debugOverlay.quadConfidence, overlaySize]);
+
+  const mappedEdgePoints = useMemo(() => {
+    if (!debugMode) return [];
+    const points = debugOverlay.edgePointsCardNorm;
+    if (!points || !points.length) return [];
+    if (!overlaySize.width || !overlaySize.height) return [];
+    return points.map((point, index) => {
+      const mapped = mapCardPointToOverlay(point, overlaySize);
+      return {
+        key: `edge-${index}`,
+        x: mapped.x,
+        y: mapped.y,
+      };
+    });
+  }, [debugMode, debugOverlay.edgePointsCardNorm, overlaySize]);
 
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0d10' }} edges={['top', 'left', 'right', 'bottom']}>
@@ -626,9 +923,7 @@ export default function ScanScreen() {
           <Text style={{ color: '#ffffff', fontSize: 30, fontWeight: '700' }}>Scan</Text>
         </View>
 
-        <Text style={{ color: '#9aa4b2', fontSize: 12 }}>
-          Engine: {usingHybrid ? 'Hybrid Hash (Beta)' : 'Legacy OCR'}
-        </Text>
+        <Text style={{ color: '#9aa4b2', fontSize: 12 }}>Engine: Fingerprint + Perspective Warp</Text>
 
         {permission === 'loading' ? (
           <View style={{ alignItems: 'center', justifyContent: 'center', paddingVertical: 40 }}>
@@ -654,58 +949,102 @@ export default function ScanScreen() {
                 borderColor: 'rgba(255,255,255,0.2)',
               }}
             >
-              {usingHybrid ? (
-                VisionCamera && visionDevice ? (
-                  <VisionCamera
-                    ref={hybridCameraRef}
-                    style={{ width: '100%', height: '100%' }}
-                    device={visionDevice}
-                    isActive={isFocused && !hasCandidates}
-                    photo
-                    onInitialized={() => setCameraReady(true)}
-                  />
-                ) : (
-                  <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-                    <Text style={{ color: '#ffb5b5' }}>{cameraInstallError || 'Hybrid camera unavailable'}</Text>
-                  </View>
-                )
-              ) : CameraView ? (
-                <CameraView
-                  ref={legacyCameraRef}
+              {VisionCamera && visionDevice ? (
+                <VisionCamera
+                  ref={hybridCameraRef}
                   style={{ width: '100%', height: '100%' }}
-                  mode="picture"
-                  facing="back"
-                  onCameraReady={() => setCameraReady(true)}
-                  autofocus="off"
+                  device={visionDevice}
+                  format={visionFormat || undefined}
+                  isActive={isFocused && !hasCandidates}
+                  photo
+                  video
+                  photoQualityBalance="speed"
+                  onInitialized={() => setCameraReady(true)}
                 />
               ) : (
                 <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center' }}>
-                  <Text style={{ color: '#ffb5b5' }}>{cameraInstallError || 'Legacy camera unavailable'}</Text>
+                  <Text style={{ color: '#ffb5b5' }}>{cameraInstallError || 'Hybrid camera unavailable'}</Text>
                 </View>
               )}
 
               <View
                 pointerEvents="none"
+                onLayout={(event) => {
+                  const { width, height } = event.nativeEvent.layout;
+                  setOverlaySize({ width, height });
+                }}
                 style={{
                   position: 'absolute',
-                  inset: 0,
+                  top: 0,
+                  right: 0,
+                  bottom: 0,
+                  left: 0,
                   alignItems: 'center',
                   justifyContent: 'center',
                 }}
               >
-                <View
-                  style={{
-                    position: 'absolute',
-                    left: `${CARD_FRAME.left * 100}%`,
-                    top: `${CARD_FRAME.top * 100}%`,
-                    width: `${CARD_FRAME.width * 100}%`,
-                    aspectRatio: CARD_FRAME.aspectRatio,
-                    borderWidth: 3,
-                    borderRadius: 10,
-                    borderColor: 'rgba(255,255,255,0.85)',
-                    backgroundColor: 'rgba(255,255,255,0.06)',
-                  }}
-                />
+                {mappedEdgePoints.map((point) => (
+                  <View
+                    key={point.key}
+                    style={{
+                      position: 'absolute',
+                      left: point.x - 1,
+                      top: point.y - 1,
+                      width: 2,
+                      height: 2,
+                      borderRadius: 1,
+                      backgroundColor: 'rgba(255,210,90,0.9)',
+                    }}
+                  />
+                ))}
+                {mappedQuad ? (
+                  <>
+                    {mappedQuad.segments.map((segment) => (
+                      <View
+                        key={segment.key}
+                        style={{
+                          position: 'absolute',
+                          left: segment.left,
+                          top: segment.top,
+                          width: segment.width,
+                          height: 2,
+                          backgroundColor: '#3ef57c',
+                          transform: [{ rotateZ: `${segment.angle}rad` }],
+                          opacity: 0.95,
+                        }}
+                      />
+                    ))}
+                    {mappedQuad.points.map((point, index) => (
+                      <View
+                        key={`pt-${index}`}
+                        style={{
+                          position: 'absolute',
+                          left: point.x - 3,
+                          top: point.y - 3,
+                          width: 6,
+                          height: 6,
+                          borderRadius: 3,
+                          backgroundColor: '#3ef57c',
+                        }}
+                      />
+                    ))}
+                    {mappedQuad.bbox ? (
+                      <View
+                        style={{
+                          position: 'absolute',
+                          left: mappedQuad.bbox.left,
+                          top: mappedQuad.bbox.top,
+                          width: mappedQuad.bbox.width,
+                          height: mappedQuad.bbox.height,
+                          borderWidth: 2,
+                          borderColor: 'rgba(62,245,124,0.8)',
+                          borderRadius: 6,
+                        }}
+                      />
+                    ) : null}
+                  </>
+                ) : null}
+
                 <View
                   style={{
                     marginTop: 14,
@@ -723,70 +1062,67 @@ export default function ScanScreen() {
                   <Text style={{ color: '#d8dde5', fontSize: 14, textAlign: 'center' }}>{hintText}</Text>
                   <Text style={{ color: '#9aa4b2', fontSize: 11, textAlign: 'center' }}>
                     {catalogReady
-                      ? usingHybrid
-                        ? 'Fingerprint-first + OCR footer disambiguation'
-                        : 'OCR title first, edition only for ambiguous matches'
+                      ? 'Hash-only pipeline: edge quad + perspective warp + fingerprint'
                       : 'Preparing local catalog...'}
                   </Text>
                 </View>
 
-                {usingHybrid ? (
-                  <View
-                    style={{
-                      position: 'absolute',
-                      left: 8,
-                      right: 8,
-                      top: 8,
-                      borderRadius: 8,
-                      paddingHorizontal: 8,
-                      paddingVertical: 6,
-                      backgroundColor: 'rgba(10,12,16,0.72)',
-                      borderWidth: 1,
-                      borderColor: 'rgba(255,255,255,0.18)',
-                      gap: 2,
-                    }}
-                  >
-                    <Text style={{ color: '#c6d0de', fontSize: 10 }}>
-                      p_hi: {debugOverlay.phashHi} | p_lo: {debugOverlay.phashLo}
-                    </Text>
-                    <Text style={{ color: '#c6d0de', fontSize: 10 }}>
-                      d_hi: {debugOverlay.dhashHi} | d_lo: {debugOverlay.dhashLo}
-                    </Text>
-                    <Text style={{ color: '#c6d0de', fontSize: 10 }}>
-                      bucket16: {debugOverlay.bucket16} | hits(raw): {debugOverlay.rawHits} | minHam:{' '}
-                      {debugOverlay.minHamming}
-                    </Text>
-                    <Text style={{ color: '#c6d0de', fontSize: 10 }}>
-                      minHamSwap(hi/lo): {debugOverlay.minHamSwap}
-                    </Text>
-                    <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
-                      perm:{permission} cam:{cameraReady ? '1' : '0'} cat:{catalogReady ? '1' : '0'}
-                    </Text>
-                    <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
-                      scan:{canScan ? '1' : '0'} focus:{isFocused ? '1' : '0'} busy:{busy ? '1' : '0'} modal:
-                      {hasCandidates ? '1' : '0'}
-                    </Text>
-                    <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
-                      cycle:{debugOverlay.cycleId} stage:{debugOverlay.lastStage} dur:{debugOverlay.lastDurationMs}ms
-                    </Text>
-                    <Text style={{ color: '#ffb5b5', fontSize: 10 }}>
-                      err:{debugOverlay.lastError}
-                    </Text>
-                    <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
-                      resize:{HASH_RESIZE_ALGO} gray:{HASH_GRAYSCALE_BIT_DEPTH}bit ar:
-                      {MTG_CARD_ASPECT_RATIO.toFixed(3)}
-                    </Text>
-                    {debugOverlay.hashPreviewUri ? (
-                      <View style={{ marginTop: 4, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
-                        <Text style={{ color: '#9fb2c9', fontSize: 10 }}>hash-img:</Text>
-                        <Image
-                          source={{ uri: debugOverlay.hashPreviewUri }}
-                          style={{ width: 48, height: 48, borderRadius: 4, borderWidth: 1, borderColor: '#5b6470' }}
-                        />
-                      </View>
-                    ) : null}
-                  </View>
-                ) : null}
+                <View
+                  style={{
+                    position: 'absolute',
+                    left: 8,
+                    right: 8,
+                    top: 8,
+                    borderRadius: 8,
+                    paddingHorizontal: 8,
+                    paddingVertical: 6,
+                    backgroundColor: 'rgba(10,12,16,0.72)',
+                    borderWidth: 1,
+                    borderColor: 'rgba(255,255,255,0.18)',
+                    gap: 2,
+                  }}
+                >
+                  <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                    p_hi: {debugOverlay.phashHi} | p_lo: {debugOverlay.phashLo}
+                  </Text>
+                  <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                    d_hi: {debugOverlay.dhashHi} | d_lo: {debugOverlay.dhashLo}
+                  </Text>
+                  <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                    bucket16: {debugOverlay.bucket16} | hits(raw): {debugOverlay.rawHits} | minHam: {debugOverlay.minHamming}
+                  </Text>
+                  <Text style={{ color: '#c6d0de', fontSize: 10 }}>minHamSwap(hi/lo): {debugOverlay.minHamSwap}</Text>
+                  <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                    quad:{debugOverlay.quadDetected} conf:{debugOverlay.quadConfidence} gate:{debugOverlay.quadGate} blur:{' '}
+                    {debugOverlay.blurVariance}
+                  </Text>
+                  <Text style={{ color: '#c6d0de', fontSize: 10 }}>
+                    edgePts:{debugOverlay.edgePointsCardNorm?.length ?? 0}
+                  </Text>
+                  <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
+                    perm:{permission} cam:{cameraReady ? '1' : '0'} cat:{catalogReady ? '1' : '0'} fp:
+                    {frameProcessorAvailable ? '1' : '0'}
+                  </Text>
+                  <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
+                    scan:{canScan ? '1' : '0'} focus:{isFocused ? '1' : '0'} busy:{busy ? '1' : '0'} modal:{hasCandidates ? '1' : '0'}
+                  </Text>
+                  <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
+                    cycle:{debugOverlay.cycleId} stage:{debugOverlay.lastStage} dur:{debugOverlay.lastDurationMs}ms
+                  </Text>
+                  <Text style={{ color: '#ffb5b5', fontSize: 10 }}>err:{debugOverlay.lastError}</Text>
+                  <Text style={{ color: '#9fb2c9', fontSize: 10 }}>
+                    resize:{HASH_RESIZE_ALGO} gray:{HASH_GRAYSCALE_BIT_DEPTH}bit ar:{MTG_CARD_ASPECT_RATIO.toFixed(3)}
+                  </Text>
+                  {debugOverlay.hashPreviewUri ? (
+                    <View style={{ marginTop: 4, flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                      <Text style={{ color: '#9fb2c9', fontSize: 10 }}>hash-img:</Text>
+                      <Image
+                        source={{ uri: debugOverlay.hashPreviewUri }}
+                        style={{ width: 48, height: 48, borderRadius: 4, borderWidth: 1, borderColor: '#5b6470' }}
+                      />
+                    </View>
+                  ) : null}
+                </View>
               </View>
             </View>
             {error ? <Text style={{ color: '#ff8a8a', textAlign: 'center' }}>{error}</Text> : null}
@@ -847,7 +1183,6 @@ export default function ScanScreen() {
             <Pressable
               onPress={() => {
                 pausedRef.current = false;
-                missStreakRef.current = 0;
                 setCandidates([]);
                 firstMissAtRef.current = Date.now();
                 setHintText('Point your camera at a card');

@@ -1,211 +1,197 @@
-import { buildSetCollectorCandidates, resolveLocalScannedCard } from './catalogResolver';
-import {
-  extractCardTextOnDevice,
-  extractCardTitleTextOnDevice,
-  extractEditionTextOnDevice,
-} from './ocrOnDevice';
 import { createImageFingerprintCandidates } from './imageFingerprint';
 import { resolveByFingerprint } from './fingerprintResolver';
 
-function normalizeCollectorNumber(value) {
-  const raw = String(value ?? '')
-    .trim()
-    .toLowerCase()
-    .replace(/^#/, '');
-  if (!raw) return '';
-  const match = raw.match(/^0*([0-9]+)([a-z]?)$/);
-  if (!match) return raw;
-  return `${Number(match[1])}${match[2]}`;
-}
+const QUAD_CONFIDENCE_GATE = 0.35;
 
-function normalizeSetCode(value) {
-  const raw = String(value ?? '').trim().toLowerCase();
-  if (!raw) return '';
-  const base = raw.split(/[-_/]/)[0] || raw;
-  const compact = base.replace(/[^a-z0-9]/g, '');
-  if (compact.length < 2 || compact.length > 6) return '';
-  return compact;
-}
-
-function extractFooterHint(editionText) {
-  const candidates = buildSetCollectorCandidates(editionText || '');
-  if (!candidates.length) return { setCode: '', collectorNumber: '' };
+function buildDebugFromFingerprint(fingerprint = {}, extra = {}) {
   return {
-    setCode: candidates[0].setCode || '',
-    collectorNumber: candidates[0].collectorNumber || '',
+    ...(extra || {}),
+    variant: fingerprint.variant ?? null,
+    blurVariance: fingerprint.blurVariance ?? null,
+    quadDetected: fingerprint.quadDetected ?? false,
+    quadConfidence: fingerprint.quadConfidence ?? null,
+    quadPointsCardNorm: fingerprint.quadPointsCardNorm ?? null,
+    edgePointsCardNorm: fingerprint.edgePointsCardNorm ?? null,
+    quadBBoxCardNorm: fingerprint.quadBBoxCardNorm ?? null,
+    hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
+    skipReason: fingerprint.skipReason || extra?.skipReason || '',
   };
 }
 
-function disambiguateCandidatesByEdition(candidates, footerHint, editionText) {
-  if (!Array.isArray(candidates) || !candidates.length) return null;
-  const editionCandidates = buildSetCollectorCandidates(editionText || '');
-  const hints = [
-    {
-      setCode: normalizeSetCode(footerHint?.setCode),
-      collectorNumber: normalizeCollectorNumber(footerHint?.collectorNumber),
-    },
-    ...editionCandidates.map((entry) => ({
-      setCode: normalizeSetCode(entry.setCode),
-      collectorNumber: normalizeCollectorNumber(entry.collectorNumber),
-    })),
-  ].filter((entry) => entry.setCode || entry.collectorNumber);
+function pickByMinHammingOrQuad(current, next) {
+  if (!next) return current;
+  if (!current) return next;
+  const currentMin = Number(current?.minHammingDistance ?? Number.POSITIVE_INFINITY);
+  const nextMin = Number(next?.minHammingDistance ?? Number.POSITIVE_INFINITY);
+  if (nextMin < currentMin) return next;
+  if (nextMin > currentMin) return current;
 
-  if (!hints.length) return null;
-  const filtered = candidates.filter((candidate) => {
-    const setCode = normalizeSetCode(candidate?.set_code);
-    const collectorNumber = normalizeCollectorNumber(candidate?.collector_number);
-    return hints.some((hint) => {
-      if (hint.setCode && hint.collectorNumber) {
-        return setCode === hint.setCode && collectorNumber === hint.collectorNumber;
-      }
-      if (hint.setCode) return setCode === hint.setCode;
-      if (hint.collectorNumber) return collectorNumber === hint.collectorNumber;
-      return false;
-    });
+  const currentQuad = Number(current?.quadConfidence ?? 0);
+  const nextQuad = Number(next?.quadConfidence ?? 0);
+  if (nextQuad > currentQuad) return next;
+
+  return current;
+}
+
+function pickByQuadConfidence(current, next) {
+  if (!next) return current;
+  if (!current) return next;
+  const currentQuad = Number(current?.quadConfidence ?? 0);
+  const nextQuad = Number(next?.quadConfidence ?? 0);
+  if (nextQuad > currentQuad) return next;
+  if (nextQuad < currentQuad) return current;
+
+  const currentBlur = Number(current?.blurVariance ?? 0);
+  const nextBlur = Number(next?.blurVariance ?? 0);
+  if (nextBlur > currentBlur) return next;
+
+  return current;
+}
+
+function isHashReady(fingerprint) {
+  if (!fingerprint || fingerprint.hashReady === false) return false;
+  return [fingerprint.phash_hi, fingerprint.phash_lo, fingerprint.dhash_hi, fingerprint.dhash_lo, fingerprint.bucket16]
+    .every((value) => Number.isFinite(Number(value)));
+}
+
+function pickTrackingCandidate(current, next) {
+  if (!next) return current;
+  if (!current) return next;
+  const currentQuad = Number(current?.quadConfidence ?? 0);
+  const nextQuad = Number(next?.quadConfidence ?? 0);
+  if (nextQuad > currentQuad) return next;
+  if (nextQuad < currentQuad) return current;
+
+  const currentBlur = Number(current?.blurVariance ?? 0);
+  const nextBlur = Number(next?.blurVariance ?? 0);
+  if (nextBlur > currentBlur) return next;
+  if (nextBlur < currentBlur) return current;
+
+  const currentDetected = current?.quadDetected ? 1 : 0;
+  const nextDetected = next?.quadDetected ? 1 : 0;
+  if (nextDetected > currentDetected) return next;
+  return current;
+}
+
+export async function analyzeFrameForQuadTracking(frameMeta = {}) {
+  const imageUri = frameMeta.imageUri || '';
+  const imageBase64 = typeof frameMeta.imageBase64 === 'string' ? frameMeta.imageBase64 : '';
+  const imageWidth = Number(frameMeta.imageWidth ?? 0);
+  const imageHeight = Number(frameMeta.imageHeight ?? 0);
+  const cardFrame = frameMeta.cardFrame || {};
+  const useSyntheticPixels = !!frameMeta.useSyntheticPixels;
+  if (!imageUri) return { status: 'none', reason: 'missing_image_uri', debug: null };
+
+  const candidates = await createImageFingerprintCandidates(imageUri, {
+    imageBase64,
+    imageWidth,
+    imageHeight,
+    cardFrame,
+    regionMode: 'full_card',
+    regionFrameInCard: frameMeta.fullCardFrameInCard,
+    maxVariants: 1,
+    includeDebugPreview: false,
+    previewOnlyFirstVariant: true,
+    useSyntheticPixels,
+    pipelineMode: 'tracking',
   });
 
-  return filtered.length === 1 ? filtered[0] : null;
-}
-
-function mergeAmbiguousCandidates(primary = [], secondary = []) {
-  const merged = [];
-  const seen = new Set();
-  for (const candidate of [...primary, ...secondary]) {
-    if (!candidate?.id) continue;
-    const key = String(candidate.id);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(candidate);
-  }
-  return merged;
-}
-
-function reconcileWithFingerprintAmbiguous(result, fingerprintAmbiguous, titleText, editionText, sourceLabel) {
-  if (!result || result.status === 'none') return null;
-  if (result.status === 'matched') {
-    if (!fingerprintAmbiguous) {
-      return {
-        ...result,
-        evidence: {
-          source: sourceLabel,
-          titleText,
-          editionText,
-        },
-        debug: fingerprintAmbiguous?.debug || null,
-      };
-    }
-
-    const fingerprintHasOcrCard = fingerprintAmbiguous.candidates?.some(
-      (entry) => String(entry.id) === String(result.cardId)
-    );
-
-    if (fingerprintHasOcrCard) {
-      return {
-        ...result,
-        matchedBy: 'fingerprint_ocr_consensus',
-        confidence: Math.max(Number(result.confidence ?? 0.8), Number(fingerprintAmbiguous.confidence ?? 0.8)),
-        evidence: {
-          source: 'fingerprint_ocr_consensus',
-          titleText,
-          editionText,
-        },
-        debug: fingerprintAmbiguous?.debug || null,
-      };
-    }
-
+  if (!Array.isArray(candidates) || !candidates.length) {
     return {
-      ...fingerprintAmbiguous,
-      matchedBy: 'fingerprint_ocr_conflict',
-      debug: fingerprintAmbiguous?.debug || null,
+      status: 'none',
+      reason: 'fingerprint_unavailable',
+      debug: null,
     };
   }
 
-  if (result.status === 'ambiguous') {
-    if (!fingerprintAmbiguous) {
-      return {
-        ...result,
-        evidence: {
-          source: sourceLabel,
-          titleText,
-          editionText,
-        },
-        debug: fingerprintAmbiguous?.debug || null,
-      };
-    }
-
+  let best = null;
+  for (const fingerprint of candidates) {
+    best = pickTrackingCandidate(best, fingerprint);
+  }
+  if (!best) {
     return {
-      status: 'ambiguous',
-      matchedBy: 'fingerprint_ocr_ambiguous',
-      confidence: Math.max(Number(fingerprintAmbiguous.confidence ?? 0.6), Number(result.confidence ?? 0.6)),
-      candidates: mergeAmbiguousCandidates(fingerprintAmbiguous.candidates || [], result.candidates || []).slice(0, 12),
-      evidence: {
-        source: 'fingerprint_ocr_ambiguous',
-        titleText,
-        editionText,
-      },
-      debug: fingerprintAmbiguous?.debug || null,
+      status: 'none',
+      reason: 'fingerprint_unavailable',
+      debug: null,
     };
   }
 
-  return null;
+  const debug = buildDebugFromFingerprint(best, { quadGate: QUAD_CONFIDENCE_GATE });
+  if (best.skipReason === 'blur_too_low') {
+    return { status: 'none', reason: 'blur_too_low', debug };
+  }
+  if (!best.quadDetected) {
+    return { status: 'none', reason: 'quad_not_detected', debug };
+  }
+  if (Number(best.quadConfidence ?? 0) < QUAD_CONFIDENCE_GATE) {
+    return { status: 'none', reason: 'quad_confidence_low', debug };
+  }
+  return { status: 'ready', reason: 'quad_ready', debug };
 }
 
 export async function processFrameAndResolveCard(frameMeta = {}) {
   const imageUri = frameMeta.imageUri || '';
   const cardFrame = frameMeta.cardFrame || {};
-  const editionFrameInCard = frameMeta.editionFrameInCard || {};
-  const enableMultilingualFallback = !!frameMeta.enableMultilingualFallback;
-  const allowOcrFallback = !!frameMeta.allowOcrFallback;
-  const skipEditionOcrInPrimary = !!frameMeta.skipEditionOcrInPrimary;
   const useSyntheticPixels = !!frameMeta.useSyntheticPixels;
+  const maxVariantsPrimary = Number(frameMeta.maxVariantsPrimary ?? 1) || 1;
+  const maxVariantsExtended = Number(frameMeta.maxVariantsExtended ?? 5) || 5;
+  const enableExtendedPass = !!frameMeta.enableExtendedPass;
+  const includeDebugPreview = !!frameMeta.includeDebugPreview;
 
   if (!imageUri) return { status: 'none', reason: 'missing_image_uri' };
 
-  // 1) Optional edition-first path (disabled for hash-only debug mode).
-  const editionText = skipEditionOcrInPrimary
-    ? ''
-    : await extractEditionTextOnDevice(imageUri, {
-        cardFrame,
-        editionFrameInCard,
-      });
-  const footerHint = extractFooterHint(editionText);
-
-  if (!skipEditionOcrInPrimary && footerHint.setCode && footerHint.collectorNumber) {
-    const editionOnlyResult = await resolveLocalScannedCard({ cardText: '', editionText });
-    if (editionOnlyResult.status === 'matched') {
-      return {
-        ...editionOnlyResult,
-        confidence: Math.max(Number(editionOnlyResult.confidence ?? 0.9), 0.95),
-        matchedBy: 'set_collector_exact',
-        evidence: {
-          source: 'edition_fast_path',
-          editionText,
-        },
-      };
-    }
-  }
-
-  // 2) Fingerprint-first resolution.
-  let fingerprintAmbiguous = null;
-  let bestFingerprintNoneDebug = null;
   let bestMatched = null;
+  let bestAmbiguous = null;
+  let bestResolverNoneDebug = null;
+  let bestQuadGateDebug = null;
+  let bestPreprocessDebug = null;
+
   const runFingerprintPass = async (maxVariants) => {
     const fingerprintCandidates = await createImageFingerprintCandidates(imageUri, {
       cardFrame,
       regionMode: 'full_card',
       regionFrameInCard: frameMeta.fullCardFrameInCard,
       maxVariants,
-      includeDebugPreview: true,
+      includeDebugPreview,
       previewOnlyFirstVariant: true,
       useSyntheticPixels,
+      pipelineMode: 'hash',
     });
     if (!Array.isArray(fingerprintCandidates) || !fingerprintCandidates.length) return;
+
     for (const fingerprint of fingerprintCandidates) {
+      const baseDebug = buildDebugFromFingerprint(fingerprint);
+      if (!isHashReady(fingerprint)) {
+        bestPreprocessDebug = pickByQuadConfidence(
+          bestPreprocessDebug,
+          {
+            ...baseDebug,
+            skipReason: baseDebug.skipReason || 'fingerprint_not_ready',
+          }
+        );
+        continue;
+      }
+
+      const quadConfidence = Number(fingerprint.quadConfidence ?? 0);
+      const quadDetected = !!fingerprint.quadDetected;
+      if (!quadDetected || quadConfidence < QUAD_CONFIDENCE_GATE) {
+        bestQuadGateDebug = pickByQuadConfidence(
+          bestQuadGateDebug,
+          {
+            ...baseDebug,
+            skipReason: 'quad_confidence_low',
+            quadGate: QUAD_CONFIDENCE_GATE,
+          }
+        );
+        continue;
+      }
+
       const fingerprintResult = await resolveByFingerprint({
-        ...fingerprint,
-        setCode: footerHint.setCode,
-        collectorNumber: footerHint.collectorNumber,
-        editionText,
+        phash_hi: fingerprint.phash_hi,
+        phash_lo: fingerprint.phash_lo,
+        dhash_hi: fingerprint.dhash_hi,
+        dhash_lo: fingerprint.dhash_lo,
+        bucket16: fingerprint.bucket16,
       });
 
       if (fingerprintResult.status === 'matched') {
@@ -214,15 +200,11 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
           evidence: {
             ...(fingerprintResult.evidence || {}),
             source: 'fingerprint',
-            editionText,
             variant: fingerprint.variant ?? null,
           },
           debug: {
             ...(fingerprintResult.debug || {}),
-            variant: fingerprint.variant ?? null,
-            blurVariance: fingerprint.blurVariance ?? null,
-            quadConfidence: fingerprint.quadConfidence ?? null,
-            hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
+            ...baseDebug,
           },
         };
         if (!bestMatched || Number(withDebug.confidence ?? 0) > Number(bestMatched?.confidence ?? 0)) {
@@ -232,151 +214,73 @@ export async function processFrameAndResolveCard(frameMeta = {}) {
       }
 
       if (fingerprintResult.status === 'ambiguous' && Array.isArray(fingerprintResult.candidates)) {
-        if (!fingerprintResult.candidates.length) {
-          continue;
-        }
-
-        const editionResolved = disambiguateCandidatesByEdition(
-          fingerprintResult.candidates,
-          footerHint,
-          editionText
-        );
-        if (editionResolved) {
-          bestMatched = {
-            status: 'matched',
-            cardId: String(editionResolved.id),
-            matchedBy: 'fingerprint_ambiguous_resolved_by_edition',
-            confidence: Math.max(0.9, Number(fingerprintResult.confidence ?? 0.85)),
-            card: editionResolved,
-            evidence: {
-              ...(fingerprintResult.evidence || {}),
-              source: 'fingerprint',
-              editionText,
-              variant: fingerprint.variant ?? null,
-            },
-            debug: {
-              ...(fingerprintResult.debug || {}),
-              variant: fingerprint.variant ?? null,
-              blurVariance: fingerprint.blurVariance ?? null,
-              quadConfidence: fingerprint.quadConfidence ?? null,
-              hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
-            },
-          };
-          continue;
-        }
-
+        if (!fingerprintResult.candidates.length) continue;
         const candidateAmbiguous = {
           ...fingerprintResult,
           evidence: {
             ...(fingerprintResult.evidence || {}),
             source: 'fingerprint',
-            editionText,
             variant: fingerprint.variant ?? null,
           },
           debug: {
             ...(fingerprintResult.debug || {}),
-            variant: fingerprint.variant ?? null,
-            blurVariance: fingerprint.blurVariance ?? null,
-            quadConfidence: fingerprint.quadConfidence ?? null,
-            hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
+            ...baseDebug,
           },
         };
 
-        if (!fingerprintAmbiguous) {
-          fingerprintAmbiguous = candidateAmbiguous;
+        if (!bestAmbiguous) {
+          bestAmbiguous = candidateAmbiguous;
         } else {
-          const prev = Number(fingerprintAmbiguous?.debug?.minHammingDistance ?? Number.POSITIVE_INFINITY);
-          const next = Number(candidateAmbiguous?.debug?.minHammingDistance ?? Number.POSITIVE_INFINITY);
-          if (next < prev) {
-            fingerprintAmbiguous = candidateAmbiguous;
-          }
+          bestAmbiguous = pickByMinHammingOrQuad(bestAmbiguous, candidateAmbiguous);
         }
+        continue;
       }
 
       if (fingerprintResult.status === 'none') {
         const candidateNoneDebug = {
           ...(fingerprintResult.debug || {}),
-          variant: fingerprint.variant ?? null,
-          blurVariance: fingerprint.blurVariance ?? null,
-          quadConfidence: fingerprint.quadConfidence ?? null,
-          hashPreviewBase64: fingerprint.hashPreviewBase64 || '',
+          ...baseDebug,
         };
-        if (!bestFingerprintNoneDebug) {
-          bestFingerprintNoneDebug = candidateNoneDebug;
-        } else {
-          const prev = Number(bestFingerprintNoneDebug.minHammingDistance ?? Number.POSITIVE_INFINITY);
-          const next = Number(candidateNoneDebug.minHammingDistance ?? Number.POSITIVE_INFINITY);
-          if (next < prev) {
-            bestFingerprintNoneDebug = candidateNoneDebug;
-          }
-        }
+        bestResolverNoneDebug = pickByMinHammingOrQuad(bestResolverNoneDebug, candidateNoneDebug);
       }
     }
   };
 
-  // Fast-path for performance: one variant only.
-  await runFingerprintPass(1);
-  // Fallback expansion only when needed.
-  if (!bestMatched && !fingerprintAmbiguous) {
-    await runFingerprintPass(5);
+  await runFingerprintPass(maxVariantsPrimary);
+  if (enableExtendedPass && !bestMatched && !bestAmbiguous) {
+    await runFingerprintPass(maxVariantsExtended);
   }
 
   if (bestMatched) return bestMatched;
-  if (fingerprintAmbiguous && !allowOcrFallback) return fingerprintAmbiguous;
+  if (bestAmbiguous) return bestAmbiguous;
 
-  if (!allowOcrFallback) {
+  if (bestResolverNoneDebug) {
     return {
       status: 'none',
       reason: 'fingerprint_no_confident_match',
-      debug: fingerprintAmbiguous?.debug || bestFingerprintNoneDebug || null,
+      debug: bestResolverNoneDebug,
     };
   }
 
-  // 3) OCR fallback - title only first.
-  const titleText = await extractCardTitleTextOnDevice(imageUri, {
-    cardFrame,
-    enableMultilingualFallback,
-  });
-
-  if (titleText || editionText) {
-    const titleResult = await resolveLocalScannedCard({
-      cardText: titleText || '',
-      editionText,
-    });
-    const reconciledTitle = reconcileWithFingerprintAmbiguous(
-      titleResult,
-      fingerprintAmbiguous,
-      titleText,
-      editionText,
-      'ocr_title_fallback'
-    );
-    if (reconciledTitle) return reconciledTitle;
+  if (bestQuadGateDebug) {
+    return {
+      status: 'none',
+      reason: 'quad_confidence_low',
+      debug: bestQuadGateDebug,
+    };
   }
 
-  // 4) OCR fallback - full card text as last chance only.
-  const cardText = await extractCardTextOnDevice(imageUri, {
-    cardFrame,
-  });
-  if (cardText || titleText || editionText) {
-    const fullResult = await resolveLocalScannedCard({
-      cardText: [titleText, cardText].filter(Boolean).join('\n'),
-      editionText,
-    });
-    const reconciledFull = reconcileWithFingerprintAmbiguous(
-      fullResult,
-      fingerprintAmbiguous,
-      titleText,
-      editionText,
-      'ocr_full_fallback'
-    );
-    if (reconciledFull) return reconciledFull;
+  if (bestPreprocessDebug) {
+    return {
+      status: 'none',
+      reason: bestPreprocessDebug.skipReason || 'fingerprint_not_ready',
+      debug: bestPreprocessDebug,
+    };
   }
-
-  if (fingerprintAmbiguous) return fingerprintAmbiguous;
 
   return {
     status: 'none',
-    reason: 'no_confident_match',
-    debug: bestFingerprintNoneDebug || null,
+    reason: 'fingerprint_unavailable',
+    debug: null,
   };
 }

@@ -11,17 +11,34 @@ import {
   splitHex64ToHiLo,
 } from './fingerprintCore.mjs';
 import {
+  buildSobelEdgeAnalysis,
+  computeLaplacianVariance,
+  computeQuadBoundingBox,
+  detectCardQuadFromEdges,
+  normalizeQuadPoints,
+} from './quadDetectionCore.mjs';
+import {
   HASH_D_HEIGHT,
   HASH_D_WIDTH,
   HASH_DEBUG_FORCE_FIXED,
   HASH_P_SIZE,
+  HASH_WARP_SIZE,
   MTG_CARD_ASPECT_RATIO,
 } from './hashConfig';
 
 let jpegModulePromise = null;
 let bufferPolyfillPromise = null;
-const DETECT_SIZE = 96;
-const BLUR_MIN_LAPLACIAN_VARIANCE = 28;
+const DETECT_PROFILE_TRACKING = Object.freeze({
+  minWidth: 320,
+  minHeight: 240,
+  maxLongSide: 480,
+});
+const DETECT_PROFILE_HASH = Object.freeze({
+  minWidth: 640,
+  minHeight: 480,
+  maxLongSide: 960,
+});
+const BLUR_MIN_LAPLACIAN_VARIANCE = 8;
 const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 const BASE64_LOOKUP = (() => {
   const map = Object.create(null);
@@ -264,6 +281,83 @@ function buildArtworkCropAction(artworkFrame, cardWidth, cardHeight) {
   return { crop: { originX, originY, width, height } };
 }
 
+function resolveDetectResize(srcWidth, srcHeight, detectProfile = DETECT_PROFILE_HASH) {
+  const width = Math.max(1, Number(srcWidth) || 1);
+  const height = Math.max(1, Number(srcHeight) || 1);
+  const minWidth = Math.max(1, Number(detectProfile?.minWidth) || DETECT_PROFILE_HASH.minWidth);
+  const minHeight = Math.max(1, Number(detectProfile?.minHeight) || DETECT_PROFILE_HASH.minHeight);
+  const maxLongSide = Math.max(
+    Math.max(minWidth, minHeight),
+    Number(detectProfile?.maxLongSide) || DETECT_PROFILE_HASH.maxLongSide
+  );
+
+  let scale = Math.max(
+    minWidth / width,
+    minHeight / height,
+    1
+  );
+  let outWidth = Math.round(width * scale);
+  let outHeight = Math.round(height * scale);
+
+  const longSide = Math.max(outWidth, outHeight);
+  if (longSide > maxLongSide) {
+    const capScale = maxLongSide / longSide;
+    outWidth = Math.max(1, Math.round(outWidth * capScale));
+    outHeight = Math.max(1, Math.round(outHeight * capScale));
+  }
+
+  if (outWidth < minWidth || outHeight < minHeight) {
+    scale = Math.max(
+      minWidth / Math.max(1, outWidth),
+      minHeight / Math.max(1, outHeight)
+    );
+    outWidth = Math.max(1, Math.round(outWidth * scale));
+    outHeight = Math.max(1, Math.round(outHeight * scale));
+  }
+
+  return { width: outWidth, height: outHeight };
+}
+
+function normalizeEdgePoints(points, width, height, maxPoints = 220) {
+  if (!Array.isArray(points) || !points.length) return [];
+  const normW = Math.max(1, Number(width) - 1);
+  const normH = Math.max(1, Number(height) - 1);
+  const step = Math.max(1, Math.ceil(points.length / maxPoints));
+  const normalized = [];
+  for (let i = 0; i < points.length; i += step) {
+    const point = points[i];
+    normalized.push({
+      x: clamp01(Number(point?.x ?? 0) / normW, 0),
+      y: clamp01(Number(point?.y ?? 0) / normH, 0),
+    });
+    if (normalized.length >= maxPoints) break;
+  }
+  return normalized;
+}
+
+function cropGrayscale(gray, width, height, cropRect) {
+  const crop = cropRect || {};
+  const originX = Math.max(0, Math.min(width - 1, Math.round(Number(crop.originX ?? 0))));
+  const originY = Math.max(0, Math.min(height - 1, Math.round(Number(crop.originY ?? 0))));
+  const maxWidth = Math.max(1, width - originX);
+  const maxHeight = Math.max(1, height - originY);
+  const outWidth = Math.max(1, Math.min(maxWidth, Math.round(Number(crop.width ?? maxWidth))));
+  const outHeight = Math.max(1, Math.min(maxHeight, Math.round(Number(crop.height ?? maxHeight))));
+  const out = new Uint8Array(outWidth * outHeight);
+  for (let y = 0; y < outHeight; y += 1) {
+    const srcRow = (originY + y) * width;
+    const dstRow = y * outWidth;
+    for (let x = 0; x < outWidth; x += 1) {
+      out[dstRow + x] = gray[srcRow + originX + x];
+    }
+  }
+  return {
+    gray: out,
+    width: outWidth,
+    height: outHeight,
+  };
+}
+
 async function getImageSize(imageUri) {
   return new Promise((resolve, reject) => {
     Image.getSize(
@@ -290,101 +384,6 @@ function sampleBilinear(gray, width, height, x, y) {
   const top = p00 * (1 - dx) + p10 * dx;
   const bottom = p01 * (1 - dx) + p11 * dx;
   return top * (1 - dy) + bottom * dy;
-}
-
-function computeLaplacianVariance(gray, width, height) {
-  if (!gray?.length || width < 3 || height < 3) return 0;
-  let sum = 0;
-  let sumSq = 0;
-  let count = 0;
-  for (let y = 1; y < height - 1; y += 1) {
-    for (let x = 1; x < width - 1; x += 1) {
-      const center = gray[y * width + x];
-      const lap =
-        gray[(y - 1) * width + x] +
-        gray[(y + 1) * width + x] +
-        gray[y * width + (x - 1)] +
-        gray[y * width + (x + 1)] -
-        4 * center;
-      sum += lap;
-      sumSq += lap * lap;
-      count += 1;
-    }
-  }
-  if (!count) return 0;
-  const mean = sum / count;
-  return Math.max(0, sumSq / count - mean * mean);
-}
-
-function computeSobelMagnitude(gray, width, height) {
-  const mag = new Float32Array(width * height);
-  if (!gray?.length || width < 3 || height < 3) return mag;
-  for (let y = 1; y < height - 1; y += 1) {
-    for (let x = 1; x < width - 1; x += 1) {
-      const i00 = gray[(y - 1) * width + (x - 1)];
-      const i01 = gray[(y - 1) * width + x];
-      const i02 = gray[(y - 1) * width + (x + 1)];
-      const i10 = gray[y * width + (x - 1)];
-      const i12 = gray[y * width + (x + 1)];
-      const i20 = gray[(y + 1) * width + (x - 1)];
-      const i21 = gray[(y + 1) * width + x];
-      const i22 = gray[(y + 1) * width + (x + 1)];
-      const gx = -i00 + i02 - 2 * i10 + 2 * i12 - i20 + i22;
-      const gy = -i00 - 2 * i01 - i02 + i20 + 2 * i21 + i22;
-      mag[y * width + x] = Math.abs(gx) + Math.abs(gy);
-    }
-  }
-  return mag;
-}
-
-function detectCardQuadFromEdges(gray, width, height) {
-  const mag = computeSobelMagnitude(gray, width, height);
-  const corners = [];
-  const regions = [
-    { x0: 0, y0: 0, x1: Math.floor(width * 0.5), y1: Math.floor(height * 0.5), cx: 0, cy: 0 }, // tl
-    { x0: Math.floor(width * 0.5), y0: 0, x1: width, y1: Math.floor(height * 0.5), cx: width - 1, cy: 0 }, // tr
-    { x0: Math.floor(width * 0.5), y0: Math.floor(height * 0.5), x1: width, y1: height, cx: width - 1, cy: height - 1 }, // br
-    { x0: 0, y0: Math.floor(height * 0.5), x1: Math.floor(width * 0.5), y1: height, cx: 0, cy: height - 1 }, // bl
-  ];
-  let scoreSum = 0;
-  for (const region of regions) {
-    let bestScore = -1;
-    let bestX = Math.floor((region.x0 + region.x1) / 2);
-    let bestY = Math.floor((region.y0 + region.y1) / 2);
-    for (let y = region.y0 + 1; y < region.y1 - 1; y += 1) {
-      for (let x = region.x0 + 1; x < region.x1 - 1; x += 1) {
-        const edge = mag[y * width + x];
-        const dx = x - region.cx;
-        const dy = y - region.cy;
-        const distPenalty = Math.sqrt(dx * dx + dy * dy) * 0.45;
-        const score = edge - distPenalty;
-        if (score > bestScore) {
-          bestScore = score;
-          bestX = x;
-          bestY = y;
-        }
-      }
-    }
-    corners.push({ x: bestX, y: bestY });
-    scoreSum += Math.max(0, bestScore);
-  }
-
-  const [tl, tr, br, bl] = corners;
-  const area = Math.abs(
-    0.5 *
-      (tl.x * tr.y +
-        tr.x * br.y +
-        br.x * bl.y +
-        bl.x * tl.y -
-        (tr.x * tl.y + br.x * tr.y + bl.x * br.y + tl.x * bl.y))
-  );
-  const minArea = width * height * 0.18;
-  if (area < minArea) return null;
-
-  return {
-    points: [tl, tr, br, bl],
-    confidence: Math.round((scoreSum / (width * height)) * 1000) / 1000,
-  };
 }
 
 function warpQuadToSquare(gray, srcWidth, srcHeight, quad, dstSize) {
@@ -417,6 +416,9 @@ export async function createImageFingerprint(imageUri, options = {}) {
 
 export async function createImageFingerprintCandidates(imageUri, options = {}) {
   if (!imageUri) return [];
+  const pipelineMode = options.pipelineMode === 'tracking' ? 'tracking' : 'hash';
+  const isTrackingMode = pipelineMode === 'tracking';
+  const detectProfile = isTrackingMode ? DETECT_PROFILE_TRACKING : DETECT_PROFILE_HASH;
   if (HASH_DEBUG_FORCE_FIXED) {
     const count = Math.max(1, Math.min(5, Number(options.maxVariants) || 1));
     return Array.from({ length: count }, (_, index) => ({
@@ -430,6 +432,24 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
       variant: index === 0 ? 'base' : `fixed-${index}`,
       variantIndex: index,
       hashPreviewBase64: '',
+      blurVariance: 999,
+      quadDetected: true,
+      quadConfidence: 1,
+      quadPointsCardNorm: [
+        { x: 0, y: 0 },
+        { x: 1, y: 0 },
+        { x: 1, y: 1 },
+        { x: 0, y: 1 },
+      ],
+      edgePointsCardNorm: [
+        { x: 0.1, y: 0.1 },
+        { x: 0.9, y: 0.1 },
+        { x: 0.9, y: 0.9 },
+        { x: 0.1, y: 0.9 },
+      ],
+      quadBBoxCardNorm: { left: 0, top: 0, width: 1, height: 1 },
+      hashReady: !isTrackingMode,
+      skipReason: isTrackingMode ? 'tracking_only' : '',
     }));
   }
 
@@ -439,29 +459,59 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
     const includeDebugPreview = !!options.includeDebugPreview;
     const previewOnlyFirstVariant = options.previewOnlyFirstVariant !== false;
     const useSyntheticPixels = !!options.useSyntheticPixels;
+    const imageBase64 = typeof options.imageBase64 === 'string' ? options.imageBase64 : '';
     const cardFrame = resolveCardFrame(options.cardFrame || {});
     const regionMode = options.regionMode === 'artwork' ? 'artwork' : 'full_card';
     const regionFrame = resolveHashRegionFrame(options.regionFrameInCard || options.artworkFrameInCard || {}, regionMode);
     const variants = buildRegionVariants(regionFrame, Number(options.maxVariants) || 5, regionMode);
-    const imageSize = await getImageSize(imageUri);
-    console.log(`[hash] image size ${imageSize.width}x${imageSize.height}`);
-    const cardCrop = buildCardCropAction(cardFrame, imageSize);
+    const allowInMemoryTracking = isTrackingMode && !!imageBase64;
+    let cardUri = imageUri;
+    let cardWidth = 0;
+    let cardHeight = 0;
+    let inMemoryCardGray = null;
+    let useInMemoryCardGray = false;
 
-    const cardActions = cardCrop ? [cardCrop] : [];
-    const cardPreview = await ImageManipulator.manipulateAsync(
-      imageUri,
-      cardActions,
-      {
-        compress: 1,
-        format: ImageManipulator.SaveFormat.JPEG,
+    if (allowInMemoryTracking) {
+      const decodedInput = await decodeJpegBase64(imageBase64);
+      if (decodedInput?.width && decodedInput?.height && decodedInput?.data) {
+        const fullGray = rgbaToGrayscale(decodedInput.data, decodedInput.width, decodedInput.height);
+        const cardCrop = buildCardCropAction(cardFrame, { width: decodedInput.width, height: decodedInput.height });
+        const cardCropRect = cardCrop?.crop || {
+          originX: 0,
+          originY: 0,
+          width: decodedInput.width,
+          height: decodedInput.height,
+        };
+        const cardCropped = cropGrayscale(fullGray, decodedInput.width, decodedInput.height, cardCropRect);
+        inMemoryCardGray = cardCropped.gray;
+        cardWidth = cardCropped.width;
+        cardHeight = cardCropped.height;
+        useInMemoryCardGray = !!inMemoryCardGray?.length;
+        console.log(`[hash] in-memory track source ${cardWidth}x${cardHeight}`);
       }
-    );
-    console.log('[hash] card crop done');
-    const cardUri = cardPreview?.uri || imageUri;
-    if (cardUri !== imageUri) tempUris.push(cardUri);
+    }
 
-    const cardWidth = cardPreview?.width ?? imageSize.width;
-    const cardHeight = cardPreview?.height ?? imageSize.height;
+    if (!useInMemoryCardGray) {
+      const imageSize = await getImageSize(imageUri);
+      console.log(`[hash] image size ${imageSize.width}x${imageSize.height}`);
+      const cardCrop = buildCardCropAction(cardFrame, imageSize);
+
+      const cardActions = cardCrop ? [cardCrop] : [];
+      const cardPreview = await ImageManipulator.manipulateAsync(
+        imageUri,
+        cardActions,
+        {
+          compress: 1,
+          format: ImageManipulator.SaveFormat.JPEG,
+        }
+      );
+      console.log('[hash] card crop done');
+      cardUri = cardPreview?.uri || imageUri;
+      if (cardUri !== imageUri) tempUris.push(cardUri);
+      cardWidth = cardPreview?.width ?? imageSize.width;
+      cardHeight = cardPreview?.height ?? imageSize.height;
+    }
+
     const results = [];
     for (const variant of variants) {
       try {
@@ -469,50 +519,165 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
         let pInput = null;
         let dInput = null;
         let debugPreviewBase64 = '';
+        const resultBase = {
+          variant: variant.tag,
+          variantIndex: variant.index,
+          blurVariance: 0,
+          quadDetected: false,
+          quadConfidence: 0,
+          quadPointsCardNorm: null,
+          edgePointsCardNorm: null,
+          quadBBoxCardNorm: null,
+          hashReady: false,
+          hashPreviewBase64: '',
+          skipReason: 'unknown',
+        };
         if (useSyntheticPixels) {
           // one-frame synthetic input to isolate camera decode path
           pInput = new Uint8Array(HASH_P_SIZE * HASH_P_SIZE);
           dInput = resizeGrayscaleNearest(pInput, HASH_P_SIZE, HASH_P_SIZE, HASH_D_WIDTH, HASH_D_HEIGHT);
+          resultBase.blurVariance = 999;
+          resultBase.quadDetected = true;
+          resultBase.quadConfidence = 1;
+          resultBase.quadPointsCardNorm = [
+            { x: 0, y: 0 },
+            { x: 1, y: 0 },
+            { x: 1, y: 1 },
+            { x: 0, y: 1 },
+          ];
+          resultBase.edgePointsCardNorm = [
+            { x: 0.1, y: 0.1 },
+            { x: 0.9, y: 0.1 },
+            { x: 0.9, y: 0.9 },
+            { x: 0.1, y: 0.9 },
+          ];
+          resultBase.quadBBoxCardNorm = { left: 0, top: 0, width: 1, height: 1 };
+          resultBase.hashReady = !isTrackingMode;
+          resultBase.skipReason = isTrackingMode ? 'tracking_only' : '';
           console.log('[hash] synthetic pixels used');
         } else {
           const regionCrop = buildArtworkCropAction(variant.frame, cardWidth, cardHeight);
-          const cropped = await buildBase64Preview(cardUri, [
-            regionCrop,
-            { resize: { width: DETECT_SIZE, height: DETECT_SIZE } },
-          ]);
-          if (cropped.uri && cropped.uri !== cardUri) tempUris.push(cropped.uri);
-          console.log(`[hash] variant=${variant.tag} decode:start`);
-          const decoded = await decodeJpegBase64(cropped.base64);
-          console.log(`[hash] variant=${variant.tag} decode:done ok=${decoded ? '1' : '0'}`);
-          if (!decoded) continue;
-          const gray = rgbaToGrayscale(decoded.data, decoded.width, decoded.height);
-          const blurVariance = computeLaplacianVariance(gray, decoded.width, decoded.height);
+          const detectResize = resolveDetectResize(regionCrop.crop.width, regionCrop.crop.height, detectProfile);
+          let gray = null;
+          let grayWidth = detectResize.width;
+          let grayHeight = detectResize.height;
+          if (useInMemoryCardGray && inMemoryCardGray) {
+            const regionGray = cropGrayscale(inMemoryCardGray, cardWidth, cardHeight, regionCrop.crop);
+            gray = resizeGrayscaleNearest(
+              regionGray.gray,
+              regionGray.width,
+              regionGray.height,
+              detectResize.width,
+              detectResize.height
+            );
+          } else {
+            const cropped = await buildBase64Preview(cardUri, [
+              regionCrop,
+              { resize: detectResize },
+            ]);
+            if (cropped.uri && cropped.uri !== cardUri) tempUris.push(cropped.uri);
+            console.log(`[hash] variant=${variant.tag} decode:start`);
+            const decoded = await decodeJpegBase64(cropped.base64);
+            console.log(`[hash] variant=${variant.tag} decode:done ok=${decoded ? '1' : '0'}`);
+            if (!decoded) {
+              results.push({
+                ...resultBase,
+                skipReason: 'decode_failed',
+              });
+              continue;
+            }
+            gray = rgbaToGrayscale(decoded.data, decoded.width, decoded.height);
+            grayWidth = decoded.width;
+            grayHeight = decoded.height;
+          }
+
+          const blurVariance = computeLaplacianVariance(gray, grayWidth, grayHeight);
+          resultBase.blurVariance = Number(blurVariance.toFixed(4));
           if (blurVariance < BLUR_MIN_LAPLACIAN_VARIANCE) {
             console.log(`[hash] variant=${variant.tag} skip:blur variance=${blurVariance.toFixed(2)}`);
+            results.push({
+              ...resultBase,
+              skipReason: 'blur_too_low',
+            });
             continue;
           }
-          const quad = detectCardQuadFromEdges(gray, decoded.width, decoded.height);
-          const warped = quad
-            ? warpQuadToSquare(gray, decoded.width, decoded.height, quad.points, HASH_P_SIZE)
-            : resizeGrayscaleNearest(gray, decoded.width, decoded.height, HASH_P_SIZE, HASH_P_SIZE);
-          const pre = preprocessGrayscaleForHash(warped);
+          const edgeAnalysis = buildSobelEdgeAnalysis(gray, grayWidth, grayHeight, {
+            cardAspectRatio: MTG_CARD_ASPECT_RATIO,
+          });
+          resultBase.edgePointsCardNorm = normalizeEdgePoints(
+            edgeAnalysis.edgePoints,
+            grayWidth,
+            grayHeight
+          );
+          const quad = detectCardQuadFromEdges(gray, grayWidth, grayHeight, {
+            cardAspectRatio: MTG_CARD_ASPECT_RATIO,
+            edgeAnalysis,
+            maxSearchMs: isTrackingMode ? 100 : 0,
+          });
+          if (!quad?.points || quad.points.length !== 4) {
+            console.log(`[hash] variant=${variant.tag} skip:quad not detected`);
+            results.push({
+              ...resultBase,
+              skipReason: 'quad_not_detected',
+            });
+            continue;
+          }
+          const quadPointsCardNorm = normalizeQuadPoints(quad.points, grayWidth, grayHeight);
+          const quadBBoxCardNorm = computeQuadBoundingBox(quadPointsCardNorm);
+          resultBase.quadDetected = true;
+          resultBase.quadConfidence = Number(quad.confidence ?? 0);
+          resultBase.quadPointsCardNorm = quadPointsCardNorm;
+          resultBase.quadBBoxCardNorm = quadBBoxCardNorm;
+          if (isTrackingMode) {
+            resultBase.hashReady = false;
+            resultBase.skipReason = 'tracking_only';
+            results.push({
+              ...resultBase,
+              hashPreviewBase64: '',
+            });
+            continue;
+          }
+
+          const warpSize = Math.max(HASH_P_SIZE, Number(HASH_WARP_SIZE) || HASH_P_SIZE);
+          const warped = warpQuadToSquare(gray, grayWidth, grayHeight, quad.points, warpSize);
+          const preHashInput =
+            warpSize === HASH_P_SIZE
+              ? warped
+              : resizeGrayscaleNearest(warped, warpSize, warpSize, HASH_P_SIZE, HASH_P_SIZE);
+          const pre = preprocessGrayscaleForHash(preHashInput);
           pInput = pre;
           dInput = resizeGrayscaleNearest(pre, HASH_P_SIZE, HASH_P_SIZE, HASH_D_WIDTH, HASH_D_HEIGHT);
+          resultBase.hashReady = true;
+          resultBase.skipReason = '';
           const shouldEncodePreview = includeDebugPreview && (!previewOnlyFirstVariant || variant.index === 0);
           debugPreviewBase64 = shouldEncodePreview ? await encodeDebugPreviewBase64(pInput) : '';
-          variant.blurVariance = blurVariance;
-          variant.quadConfidence = quad?.confidence ?? 0;
         }
 
+        if (!resultBase.hashReady) {
+          results.push({
+            ...resultBase,
+            hashPreviewBase64: '',
+          });
+          continue;
+        }
         console.log(`[hash] variant=${variant.tag} hash:start`);
         const phashHex = computePHash64FromGrayscale(pInput, HASH_P_SIZE, HASH_P_SIZE);
         const dhashHex = computeDHash64FromGrayscale(dInput, HASH_D_WIDTH, HASH_D_HEIGHT);
         const pSplit = splitHex64ToHiLo(phashHex);
         const dSplit = splitHex64ToHiLo(dhashHex);
-        if (!pSplit || !dSplit) continue;
+        if (!pSplit || !dSplit) {
+          results.push({
+            ...resultBase,
+            hashReady: false,
+            hashPreviewBase64: '',
+            skipReason: 'hash_split_failed',
+          });
+          continue;
+        }
         console.log(`[hash] variant=${variant.tag} hash:done`);
 
         results.push({
+          ...resultBase,
           phash64: phashHex,
           dhash64: dhashHex,
           phash_hi: pSplit.hi,
@@ -520,11 +685,15 @@ export async function createImageFingerprintCandidates(imageUri, options = {}) {
           dhash_hi: dSplit.hi,
           dhash_lo: dSplit.lo,
           bucket16: deriveBucket16FromHi(pSplit.hi),
-          variant: variant.tag,
-          variantIndex: variant.index,
-          blurVariance: Number(variant.blurVariance ?? 0),
-          quadConfidence: Number(variant.quadConfidence ?? 0),
+          blurVariance: Number(resultBase.blurVariance ?? 0),
+          quadDetected: !!resultBase.quadDetected,
+          quadConfidence: Number(resultBase.quadConfidence ?? 0),
+          quadPointsCardNorm: resultBase.quadPointsCardNorm ?? null,
+          edgePointsCardNorm: resultBase.edgePointsCardNorm ?? [],
+          quadBBoxCardNorm: resultBase.quadBBoxCardNorm ?? null,
+          hashReady: true,
           hashPreviewBase64: debugPreviewBase64,
+          skipReason: '',
         });
       } catch (variantError) {
         console.error(

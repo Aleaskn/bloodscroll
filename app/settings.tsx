@@ -8,12 +8,6 @@ import {
   getCatalogMeta,
 } from '../data/catalogUpdate';
 import { getFingerprintStats } from '../data/catalogDb';
-import {
-  getScanSettings,
-  SCANNER_ENGINES,
-  setMultilingualFallback,
-  setScannerEngine,
-} from '../data/scanSettings';
 import { getScanMetricsSummary } from '../data/scanMetrics';
 
 function formatDate(value) {
@@ -31,24 +25,18 @@ function percent(value) {
 export default function SettingsScreen() {
   const [meta, setMeta] = useState<any>(null);
   const [fingerprintStats, setFingerprintStats] = useState({ total: 0, uniqueCards: 0 });
-  const [scanSettings, setScanSettingsState] = useState({
-    engine: SCANNER_ENGINES.LEGACY_OCR,
-    multilingualFallback: false,
-  });
   const [metrics, setMetrics] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
   const [message, setMessage] = useState('');
 
   const refreshAll = useCallback(async () => {
-    const [catalogMeta, settings, fpStats, metricsSummary] = await Promise.all([
+    const [catalogMeta, fpStats, metricsSummary] = await Promise.all([
       getCatalogMeta(),
-      getScanSettings(),
       getFingerprintStats(),
       getScanMetricsSummary({ sinceDays: 7 }),
     ]);
     setMeta(catalogMeta);
-    setScanSettingsState(settings);
     setFingerprintStats(fpStats);
     setMetrics(metricsSummary);
   }, []);
@@ -119,31 +107,6 @@ export default function SettingsScreen() {
     }
   }, [applyUpdate, refreshAll]);
 
-  const switchEngine = useCallback(
-    async (engine) => {
-      setChecking(true);
-      try {
-        await setScannerEngine(engine);
-        await refreshAll();
-      } finally {
-        setChecking(false);
-      }
-    },
-    [refreshAll]
-  );
-
-  const toggleMultilingualFallback = useCallback(async () => {
-    setChecking(true);
-    try {
-      await setMultilingualFallback(!scanSettings.multilingualFallback);
-      await refreshAll();
-    } finally {
-      setChecking(false);
-    }
-  }, [scanSettings.multilingualFallback, refreshAll]);
-
-  const isHybrid = scanSettings.engine === SCANNER_ENGINES.HYBRID_HASH_BETA;
-
   return (
     <SafeAreaView style={{ flex: 1, backgroundColor: '#0b0d10' }} edges={['top', 'left', 'right']}>
       <View style={{ flex: 1, paddingHorizontal: 20, gap: 12 }}>
@@ -183,67 +146,14 @@ export default function SettingsScreen() {
             borderColor: 'rgba(255,255,255,0.2)',
             backgroundColor: 'rgba(255,255,255,0.03)',
             padding: 12,
-            gap: 10,
+            gap: 8,
           }}
         >
-          <Text style={{ color: '#ffffff', fontWeight: '700' }}>Scanner Engine</Text>
-          <View style={{ flexDirection: 'row', gap: 8 }}>
-            <Pressable
-              onPress={() => switchEngine(SCANNER_ENGINES.LEGACY_OCR)}
-              disabled={checking}
-              style={{
-                flex: 1,
-                minHeight: 42,
-                borderRadius: 10,
-                borderWidth: 1,
-                borderColor:
-                  scanSettings.engine === SCANNER_ENGINES.LEGACY_OCR
-                    ? 'rgba(130,205,255,0.9)'
-                    : 'rgba(255,255,255,0.28)',
-                alignItems: 'center',
-                justifyContent: 'center',
-                opacity: checking ? 0.6 : 1,
-              }}
-            >
-              <Text style={{ color: '#ffffff' }}>Legacy OCR</Text>
-            </Pressable>
-            <Pressable
-              onPress={() => switchEngine(SCANNER_ENGINES.HYBRID_HASH_BETA)}
-              disabled={checking}
-              style={{
-                flex: 1,
-                minHeight: 42,
-                borderRadius: 10,
-                borderWidth: 1,
-                borderColor:
-                  scanSettings.engine === SCANNER_ENGINES.HYBRID_HASH_BETA
-                    ? 'rgba(130,205,255,0.9)'
-                    : 'rgba(255,255,255,0.28)',
-                alignItems: 'center',
-                justifyContent: 'center',
-                opacity: checking ? 0.6 : 1,
-              }}
-            >
-              <Text style={{ color: '#ffffff' }}>Hybrid Hash (Beta)</Text>
-            </Pressable>
-          </View>
-          <Pressable
-            onPress={toggleMultilingualFallback}
-            disabled={checking || !isHybrid}
-            style={{
-              minHeight: 42,
-              borderRadius: 10,
-              borderWidth: 1,
-              borderColor: 'rgba(255,255,255,0.3)',
-              alignItems: 'center',
-              justifyContent: 'center',
-              opacity: checking || !isHybrid ? 0.55 : 1,
-            }}
-          >
-            <Text style={{ color: '#ffffff' }}>
-              OCR multilingual fallback: {scanSettings.multilingualFallback ? 'ON' : 'OFF'}
-            </Text>
-          </Pressable>
+          <Text style={{ color: '#ffffff', fontWeight: '700' }}>Scanner mode</Text>
+          <Text style={{ color: '#9aa4b2' }}>Fingerprint + Perspective Warp (hash-only)</Text>
+          <Text style={{ color: '#9aa4b2' }}>
+            Binary gate active: frame is processed only when quad detection confidence is high.
+          </Text>
         </View>
 
         <View

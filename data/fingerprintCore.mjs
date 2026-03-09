@@ -1,4 +1,4 @@
-import { HASH_ENABLE_HIST_EQUALIZATION } from './hashConfig';
+import { HASH_ENABLE_HIST_EQUALIZATION } from './hashConfig.mjs';
 
 function clampByte(value) {
   const n = Number(value);

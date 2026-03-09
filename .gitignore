@@ -41,3 +41,6 @@ app-example
 # generated native folders
 /ios
 /android
+
+# local bundled catalog db (keep local only)
+assets/catalog/cards-catalog.db

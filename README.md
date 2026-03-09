@@ -18,18 +18,24 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
 
 ## Local MTG scanner (offline-first)
 
-The scanner supports two engines in `Settings`:
+Scanner runtime is now a single hash-only pipeline:
 
-- `Legacy OCR`: OCR-only matching (fallback mode).
-- `Hybrid Hash (Beta)`: image fingerprint first (`pHash/dHash`) + OCR footer disambiguation.
+- `Fingerprint + Perspective Warp`: edge-based quad detection, card rectification, `pHash/dHash`, local SQLite resolution.
 
-Runtime architecture for hybrid:
+Runtime architecture:
 
 1. Capture card frame.
-2. Build artwork fingerprint locally.
-3. Query local SQLite shortlist (`catalog_card_fingerprint`).
-4. Disambiguate with footer OCR (`set_code + collector_number`).
-5. Auto-open only after confidence + stability gate.
+2. Run blur check + edge quad detection.
+3. Apply perspective warp from detected quad.
+4. Build fingerprint locally.
+5. Query local SQLite shortlist (`catalog_card_fingerprint`).
+6. Auto-open only after confidence + stability gate.
+
+### Quad gate binary behavior
+
+- Frame processing is binary: if `quadConfidence < 0.35`, the frame is not used for matching.
+- Overlay box/lines are shown only when a valid quad is detected above gate threshold.
+- This avoids fallback matching on misaligned crops/background.
 
 ### Dev build requirement
 
